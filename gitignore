@@ -1,0 +1,5 @@
+ben_memory.db
+*.db
+__pycache__/
+*.pyc
+.env
