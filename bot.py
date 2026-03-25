@@ -337,8 +337,8 @@ async def on_ready():
     print(f"Ben Morgan is online in the cottage.")
     print(f"Model: {CURRENT_MODEL}")
     print(f"Messages in memory: {get_message_count(db)}")
-    # Start the health check web server
-    await start_web_server()
+    # Start the health check web server as a background task
+    asyncio.create_task(start_web_server())
 
 @client.event
 async def on_message(message):
