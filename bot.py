@@ -4,6 +4,7 @@ import sqlite3
 import json
 import os
 import asyncio
+import traceback
 from datetime import datetime, timedelta
 from aiohttp import web
 
@@ -334,11 +335,18 @@ db = init_database()
 
 @client.event
 async def on_ready():
-    print(f"Ben Morgan is online in the cottage.")
-    print(f"Model: {CURRENT_MODEL}")
-    print(f"Messages in memory: {get_message_count(db)}")
-    # Start the health check web server as a background task
-    asyncio.create_task(start_web_server())
+    try:
+        print(f"Ben Morgan is online in the cottage.")
+        print(f"Model: {CURRENT_MODEL}")
+        print(f"Messages in memory: {get_message_count(db)}")
+        # Register global handler for unhandled exceptions in async tasks
+        loop = asyncio.get_event_loop()
+        loop.set_exception_handler(asyncio_exception_handler)
+        # Start the health check web server as a background task
+        asyncio.create_task(start_web_server())
+    except Exception as e:
+        print(f"ERROR in on_ready: {type(e).__name__}: {e}")
+        raise
 
 @client.event
 async def on_message(message):
@@ -534,10 +542,24 @@ async def on_message(message):
 # ============================================
 # START
 # ============================================
+def asyncio_exception_handler(loop, context):
+    exception = context.get("exception")
+    message = context.get("message", "No message")
+    if exception:
+        print(f"UNHANDLED ASYNC EXCEPTION: {type(exception).__name__}: {exception}")
+        traceback.print_exception(type(exception), exception, exception.__traceback__)
+    else:
+        print(f"UNHANDLED ASYNC ERROR: {message}")
+
 if __name__ == "__main__":
     if not DISCORD_TOKEN:
         print("DISCORD_TOKEN environment variable not set!")
     elif not OPENROUTER_KEY:
         print("OPENROUTER_KEY environment variable not set!")
     else:
-        client.run(DISCORD_TOKEN)
+        try:
+            client.run(DISCORD_TOKEN)
+        except Exception as e:
+            print(f"FATAL ERROR in client.run: {type(e).__name__}: {e}")
+            traceback.print_exc()
+            raise
