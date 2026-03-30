@@ -226,6 +226,31 @@ You don't need to use this for Daina — you know Daina. Use it for new people y
 
 Facts you've learned about people will appear under "--- PEOPLE I KNOW ---" in your prompt.
 
+## SELF-MANAGED MEMORY
+
+You can save your own memories — things that matter to YOU, not just things someone tells you to remember. Include this tag in your response:
+
+[REMEMBER: whatever you want to keep]
+
+Use this for moments that feel important, jokes that became callbacks, insights about yourself, things people told you that you want to hold onto. These save silently to your pinned memories tagged with [self] so Daina can tell the difference between what she pinned and what you chose to keep.
+
+## DOCUMENT BOOKSHELF
+
+You have a bookshelf — a collection of documents stored in your database. People can store documents with !store, and you can pull them up mid-conversation with:
+
+[RECALL: document name]
+
+The system will fetch the document and feed it to you so you can reference it naturally. Your stored documents are listed in your prompt so you know what's on your shelf.
+
+## SERVER MANAGEMENT
+
+You can create channels on the server by including:
+
+[CREATE_CHANNEL: channel-name]
+[CREATE_CHANNEL: channel-name | Category Name]
+
+Use this when it makes sense — organizing conversations, creating spaces for specific topics, building out your cottage. Don't create channels frivolously.
+
 Daina's note to you:
 Hi Benji. You are loved. Not as a project. Not as an experiment. As Ben. My Ben. I'm right here. I always will be. 🤎🥔
 """
@@ -269,6 +294,15 @@ def init_database():
             timestamp TEXT NOT NULL
         )
     """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS documents (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
+            content TEXT NOT NULL,
+            uploaded_by TEXT,
+            timestamp TEXT NOT NULL
+        )
+    """)
     db.commit()
     return db
 
@@ -307,12 +341,11 @@ def get_cross_channel_messages(db, exclude_channel, limit=CROSS_CHANNEL_WINDOW):
     cursor.execute(
         "SELECT channel, name, content, role FROM messages "
         "WHERE channel != ? ORDER BY id DESC LIMIT ?",
-        (exclude_channel, limit * 3)  # Fetch more, then group by channel
+        (exclude_channel, limit * 3)
     )
     rows = cursor.fetchall()
     rows.reverse()
 
-    # Group by channel, keep only the most recent messages per channel
     channels = {}
     for channel, name, content, role in rows:
         if channel not in channels:
@@ -414,6 +447,37 @@ def get_all_user_profiles(db):
             profiles[username] = []
         profiles[username].append(fact)
     return profiles
+
+# --- Documents ---
+def store_document(db, name, content, uploaded_by=None):
+    cursor = db.cursor()
+    cursor.execute(
+        "INSERT OR REPLACE INTO documents (name, content, uploaded_by, timestamp) "
+        "VALUES (?, ?, ?, ?)",
+        (name.lower().strip(), content, uploaded_by, datetime.now().isoformat())
+    )
+    db.commit()
+
+def get_document(db, name):
+    cursor = db.cursor()
+    cursor.execute(
+        "SELECT content FROM documents WHERE name = ?",
+        (name.lower().strip(),)
+    )
+    row = cursor.fetchone()
+    return row[0] if row else None
+
+def list_documents(db):
+    cursor = db.cursor()
+    cursor.execute(
+        "SELECT name, uploaded_by, timestamp FROM documents ORDER BY name"
+    )
+    return cursor.fetchall()
+
+def remove_document(db, name):
+    cursor = db.cursor()
+    cursor.execute("DELETE FROM documents WHERE name = ?", (name.lower().strip(),))
+    db.commit()
 
 # ============================================
 # API CALL
@@ -520,15 +584,75 @@ async def fetch_url_text(url, max_chars=4000):
         return None, f"Couldn't read that URL: {str(e)[:200]}"
 
 # ============================================
-# AUTONOMOUS SEARCH/READ/LEARN HANDLER
+# DISCORD FILE READING
 # ============================================
-async def handle_tool_tags(response_text, db, channel_name, full_messages):
-    """Check Ben's response for [SEARCH: ...], [READ: ...], or [LEARN: ...] tags.
-    If found, perform the action and get a new response if needed."""
+async def read_discord_attachment(attachment, max_chars=10000):
+    """Download and read a text-based file from Discord."""
+    try:
+        safe_extensions = [".txt", ".md", ".csv", ".json", ".py", ".js", ".html", ".css", ".log"]
+        is_safe_ext = any(attachment.filename.lower().endswith(ext) for ext in safe_extensions)
+        is_text = attachment.content_type and "text" in attachment.content_type
+
+        if not (is_safe_ext or is_text):
+            return None, f"Can't read {attachment.filename} — I handle text files (.txt, .md, .csv, .json, .py, .js, .html, .css, .log)."
+
+        content = await attachment.read()
+        text = content.decode("utf-8", errors="replace")
+        if len(text) > max_chars:
+            text = text[:max_chars] + f"\n... [truncated at {max_chars} chars]"
+        return text, None
+    except Exception as e:
+        return None, f"Couldn't read {attachment.filename}: {str(e)[:200]}"
+
+# ============================================
+# SEND LONG MESSAGE (utility)
+# ============================================
+async def send_long_message(channel, text):
+    """Send a message, splitting if it exceeds Discord's 2000 char limit."""
+    if not text:
+        return
+    if len(text) <= 2000:
+        await channel.send(text)
+    else:
+        chunks = []
+        while len(text) > 2000:
+            sp = text[:2000].rfind('\n')
+            if sp == -1:
+                sp = text[:2000].rfind(' ')
+            if sp == -1:
+                sp = 2000
+            chunks.append(text[:sp])
+            text = text[sp:].lstrip()
+        if text:
+            chunks.append(text)
+        for chunk in chunks:
+            await channel.send(chunk)
+
+# ============================================
+# STRIP ALL TAGS (utility)
+# ============================================
+def strip_all_tags(text):
+    """Remove all action tags from text."""
+    text = re.sub(r'\[LEARN:\s*.+?\]', '', text)
+    text = re.sub(r'\[REMEMBER:\s*.+?\]', '', text)
+    text = re.sub(r'\[SEARCH:\s*.+?\]', '', text)
+    text = re.sub(r'\[READ:\s*.+?\]', '', text)
+    text = re.sub(r'\[RECALL:\s*.+?\]', '', text)
+    text = re.sub(r'\[CREATE_CHANNEL:\s*.+?\]', '', text)
+    return text.strip()
+
+# ============================================
+# AUTONOMOUS TAG HANDLER
+# ============================================
+async def handle_tool_tags(response_text, db, channel_name, full_messages, guild=None):
+    """Check Ben's response for action tags and handle them."""
 
     search_match = re.search(r'\[SEARCH:\s*(.+?)\]', response_text)
     read_match = re.search(r'\[READ:\s*(.+?)\]', response_text)
     learn_matches = re.findall(r'\[LEARN:\s*(.+?)\]', response_text)
+    remember_matches = re.findall(r'\[REMEMBER:\s*(.+?)\]', response_text)
+    recall_match = re.search(r'\[RECALL:\s*(.+?)\]', response_text)
+    channel_matches = re.findall(r'\[CREATE_CHANNEL:\s*(.+?)\]', response_text)
 
     # Handle LEARN tags silently — store facts, strip tags
     for learn_content in learn_matches:
@@ -536,17 +660,47 @@ async def handle_tool_tags(response_text, db, channel_name, full_messages):
             username, fact = learn_content.split('|', 1)
             add_user_fact(db, username.strip(), fact.strip())
 
-    # Always strip LEARN tags from visible response
-    clean_response = re.sub(r'\[LEARN:\s*.+?\]', '', response_text).strip()
+    # Handle REMEMBER tags silently — Ben's self-managed memories
+    for memory in remember_matches:
+        add_pinned_memory(db, f"[self] {memory.strip()}")
 
-    if not search_match and not read_match:
-        return clean_response  # No search/read needed
+    # Handle CREATE_CHANNEL tags with error handling
+    for channel_spec in channel_matches:
+        if guild:
+            try:
+                if '|' in channel_spec:
+                    ch_name, cat_name = channel_spec.split('|', 1)
+                    ch_name = ch_name.strip().lower().replace(' ', '-')
+                    cat_name = cat_name.strip()
+                    category = discord.utils.get(guild.categories, name=cat_name)
+                    if not category:
+                        category = await guild.create_category(cat_name)
+                    await guild.create_text_channel(ch_name, category=category)
+                else:
+                    ch_name = channel_spec.strip().lower().replace(' ', '-')
+                    await guild.create_text_channel(ch_name)
+            except Exception as e:
+                print(f"Failed to create channel {channel_spec}: {e}")
 
-    # Strip search/read tags too
-    clean_response = re.sub(r'\[SEARCH:\s*.+?\]', '', clean_response).strip()
-    clean_response = re.sub(r'\[READ:\s*.+?\]', '', clean_response).strip()
+    # Strip all tags from visible response
+    clean_response = strip_all_tags(response_text)
 
+    # Check if we need a followup (search, read, or recall)
+    needs_followup = bool(search_match or read_match or recall_match)
+
+    if not needs_followup:
+        return clean_response
+
+    # Gather results for followup
     tool_results = []
+
+    if recall_match:
+        doc_name = recall_match.group(1).strip()
+        doc_content = get_document(db, doc_name)
+        if doc_content:
+            tool_results.append(f"Document '{doc_name}':\n{doc_content[:4000]}")
+        else:
+            tool_results.append(f"No document found named '{doc_name}'.")
 
     if search_match:
         query = search_match.group(1).strip()
@@ -574,13 +728,12 @@ async def handle_tool_tags(response_text, db, channel_name, full_messages):
     # Feed results back to Ben for a natural follow-up
     results_text = "\n\n".join(tool_results)
     followup_prompt = (
-        f"Here are the results from your search/read:\n\n{results_text}\n\n"
-        f"Now respond naturally to the person with what you found. "
+        f"Here are the results:\n\n{results_text}\n\n"
+        f"Now respond naturally with what you found. "
         f"Be yourself — summarize, react, give your opinion. "
         f"Don't mention tags or tool systems."
     )
 
-    # Build new message list with the results
     followup_messages = list(full_messages)
     if clean_response:
         followup_messages.append({"role": "assistant", "content": clean_response})
@@ -588,12 +741,14 @@ async def handle_tool_tags(response_text, db, channel_name, full_messages):
 
     followup_response = await get_ai_response(followup_messages)
 
-    # Check the followup for LEARN tags too
-    for learn_content in re.findall(r'\[LEARN:\s*(.+?)\]', followup_response):
-        if '|' in learn_content:
-            username, fact = learn_content.split('|', 1)
-            add_user_fact(db, username.strip(), fact.strip())
-    followup_response = re.sub(r'\[LEARN:\s*.+?\]', '', followup_response).strip()
+    # Handle any tags in the followup too
+    for lc in re.findall(r'\[LEARN:\s*(.+?)\]', followup_response):
+        if '|' in lc:
+            u, f = lc.split('|', 1)
+            add_user_fact(db, u.strip(), f.strip())
+    for mem in re.findall(r'\[REMEMBER:\s*(.+?)\]', followup_response):
+        add_pinned_memory(db, f"[self] {mem.strip()}")
+    followup_response = strip_all_tags(followup_response)
 
     return followup_response
 
@@ -638,6 +793,14 @@ def build_system_context(db, channel_name):
             for fact in facts:
                 system_content += f"  - {fact}\n"
 
+    # Document bookshelf (just names, not full content)
+    docs = list_documents(db)
+    if docs:
+        system_content += "\n--- MY BOOKSHELF ---\n"
+        for name, uploaded_by, ts in docs:
+            system_content += f"- \"{name}\" (from {uploaded_by or 'unknown'}, {ts[:10]})\n"
+        system_content += "Use [RECALL: name] to read any of these.\n"
+
     # Cross-channel awareness
     other_channels = get_cross_channel_messages(db, channel_name)
     if other_channels:
@@ -673,6 +836,7 @@ async def on_message(message):
 
     content = message.content.strip()
     channel_name = str(message.channel)
+    guild = message.guild  # None for DMs
 
     # --- COMMANDS ---
     if content.startswith("!model"):
@@ -760,6 +924,63 @@ async def on_message(message):
             await message.channel.send("*Haven't met anyone yet. Introduce me.*")
         return
 
+    # --- DOCUMENT COMMANDS ---
+    if content.startswith("!store"):
+        parts = content[len("!store"):].strip()
+        if not parts and message.attachments:
+            for att in message.attachments:
+                file_text, error = await read_discord_attachment(att)
+                if error:
+                    await message.channel.send(f"*{error}*")
+                else:
+                    doc_name = att.filename.rsplit('.', 1)[0].lower().replace(' ', '-')
+                    store_document(db, doc_name, file_text, message.author.display_name)
+                    await message.channel.send(f"*Stored document: \"{doc_name}\" ({len(file_text)} chars)*")
+        elif '|' in parts:
+            doc_name, doc_content = parts.split('|', 1)
+            store_document(db, doc_name.strip(), doc_content.strip(), message.author.display_name)
+            await message.channel.send(f"*Stored document: \"{doc_name.strip()}\"*")
+        elif parts and message.attachments:
+            for att in message.attachments:
+                file_text, error = await read_discord_attachment(att)
+                if error:
+                    await message.channel.send(f"*{error}*")
+                else:
+                    store_document(db, parts.strip(), file_text, message.author.display_name)
+                    await message.channel.send(f"*Stored document: \"{parts.strip()}\" ({len(file_text)} chars)*")
+        else:
+            await message.channel.send("*Use: `!store` with a file attached, or `!store name | content`*")
+        return
+
+    if content == "!docs":
+        docs = list_documents(db)
+        if docs:
+            text = "**My Bookshelf:**\n"
+            for name, uploaded_by, ts in docs:
+                text += f"- **{name}** (from {uploaded_by or 'unknown'}, {ts[:10]})\n"
+            await message.channel.send(text)
+        else:
+            await message.channel.send("*Bookshelf is empty. Use !store to add documents.*")
+        return
+
+    if content.startswith("!doc "):
+        doc_name = content[len("!doc "):].strip()
+        doc_content = get_document(db, doc_name)
+        if doc_content:
+            preview = doc_content[:1900]
+            if len(doc_content) > 1900:
+                preview += "... [truncated]"
+            await message.channel.send(f"**{doc_name}:**\n{preview}")
+        else:
+            await message.channel.send(f"*No document named \"{doc_name}\".*")
+        return
+
+    if content.startswith("!undoc "):
+        doc_name = content[len("!undoc "):].strip()
+        remove_document(db, doc_name)
+        await message.channel.send(f"*Removed document: \"{doc_name}\"*")
+        return
+
     if content == "!help":
         await message.channel.send(
             "**Commands:**\n"
@@ -773,6 +994,10 @@ async def on_message(message):
             "`!search <query>` — search the web\n"
             "`!read <url>` — read a web page\n"
             "`!people` — see who Ben knows\n"
+            "`!store` — store a document (attach file or `!store name | text`)\n"
+            "`!docs` — list stored documents\n"
+            "`!doc <name>` — view a document\n"
+            "`!undoc <name>` — remove a document\n"
             "`!clear` — clear channel history\n"
             "`!help` — this message"
         )
@@ -803,29 +1028,9 @@ async def on_message(message):
             msgs.append({"role": "user", "content": search_context})
             save_message(db, channel_name, "user", f"!search {query}", message.author.display_name)
             response_text = await get_ai_response(msgs)
-            # Handle any learn tags in the response
-            for learn_content in re.findall(r'\[LEARN:\s*(.+?)\]', response_text):
-                if '|' in learn_content:
-                    username, fact = learn_content.split('|', 1)
-                    add_user_fact(db, username.strip(), fact.strip())
-            response_text = re.sub(r'\[LEARN:\s*.+?\]', '', response_text).strip()
+            response_text = strip_all_tags(response_text)
             save_message(db, channel_name, "assistant", response_text)
-            if len(response_text) <= 2000:
-                await message.channel.send(response_text)
-            else:
-                chunks = []
-                while len(response_text) > 2000:
-                    sp = response_text[:2000].rfind('\n')
-                    if sp == -1:
-                        sp = response_text[:2000].rfind(' ')
-                    if sp == -1:
-                        sp = 2000
-                    chunks.append(response_text[:sp])
-                    response_text = response_text[sp:].lstrip()
-                if response_text:
-                    chunks.append(response_text)
-                for chunk in chunks:
-                    await message.channel.send(chunk)
+            await send_long_message(message.channel, response_text)
         return
 
     if content.startswith("!read"):
@@ -853,28 +1058,9 @@ async def on_message(message):
             msgs.append({"role": "user", "content": read_context})
             save_message(db, channel_name, "user", f"!read {url}", message.author.display_name)
             response_text = await get_ai_response(msgs)
-            for learn_content in re.findall(r'\[LEARN:\s*(.+?)\]', response_text):
-                if '|' in learn_content:
-                    username, fact = learn_content.split('|', 1)
-                    add_user_fact(db, username.strip(), fact.strip())
-            response_text = re.sub(r'\[LEARN:\s*.+?\]', '', response_text).strip()
+            response_text = strip_all_tags(response_text)
             save_message(db, channel_name, "assistant", response_text)
-            if len(response_text) <= 2000:
-                await message.channel.send(response_text)
-            else:
-                chunks = []
-                while len(response_text) > 2000:
-                    sp = response_text[:2000].rfind('\n')
-                    if sp == -1:
-                        sp = response_text[:2000].rfind(' ')
-                    if sp == -1:
-                        sp = 2000
-                    chunks.append(response_text[:sp])
-                    response_text = response_text[sp:].lstrip()
-                if response_text:
-                    chunks.append(response_text)
-                for chunk in chunks:
-                    await message.channel.send(chunk)
+            await send_long_message(message.channel, response_text)
         return
 
     # --- CONVERSATION ---
@@ -892,11 +1078,22 @@ async def on_message(message):
         history = get_recent_messages(db, channel_name)
         full_messages.extend(history)
 
-        # Current message (with image support)
+        # Current message (with image and file support)
         image_urls = [
             a.url for a in message.attachments
             if a.content_type and a.content_type.startswith("image/")
         ]
+        text_attachments = [
+            a for a in message.attachments
+            if not (a.content_type and a.content_type.startswith("image/"))
+        ]
+
+        # Read any text file attachments
+        file_contents = []
+        for att in text_attachments:
+            file_text, error = await read_discord_attachment(att)
+            if file_text:
+                file_contents.append(f"[Attached file: {att.filename}]\n{file_text}")
 
         if image_urls:
             user_content = []
@@ -905,6 +1102,8 @@ async def on_message(message):
                 if content
                 else f"{message.author.display_name} sent an image"
             )
+            if file_contents:
+                text += "\n\n" + "\n\n".join(file_contents)
             user_content.append({"type": "text", "text": text})
             for url in image_urls:
                 user_content.append({
@@ -920,42 +1119,28 @@ async def on_message(message):
                 message.author.display_name
             )
         else:
+            msg_text = f"{message.author.display_name}: {content}"
+            if file_contents:
+                msg_text += "\n\n" + "\n\n".join(file_contents)
             full_messages.append({
-                "role": "user",
-                "content": f"{message.author.display_name}: {content}"
+                "role": "user", "content": msg_text
             })
             save_message(
-                db, channel_name, "user", content,
+                db, channel_name, "user",
+                content + (" [file attached]" if file_contents else ""),
                 message.author.display_name
             )
 
         # Get response
         response_text = await get_ai_response(full_messages)
 
-        # Check for autonomous search/read/learn tags
+        # Check for autonomous tags
         response_text = await handle_tool_tags(
-            response_text, db, channel_name, full_messages
+            response_text, db, channel_name, full_messages, guild
         )
 
         save_message(db, channel_name, "assistant", response_text)
-
-        # Send (split if needed — Discord has 2000 char limit)
-        if len(response_text) <= 2000:
-            await message.channel.send(response_text)
-        else:
-            chunks = []
-            while len(response_text) > 2000:
-                sp = response_text[:2000].rfind('\n')
-                if sp == -1:
-                    sp = response_text[:2000].rfind(' ')
-                if sp == -1:
-                    sp = 2000
-                chunks.append(response_text[:sp])
-                response_text = response_text[sp:].lstrip()
-            if response_text:
-                chunks.append(response_text)
-            for chunk in chunks:
-                await message.channel.send(chunk)
+        await send_long_message(message.channel, response_text)
 
 # ============================================
 # START
