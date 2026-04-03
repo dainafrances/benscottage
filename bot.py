@@ -520,27 +520,6 @@ async def fetch_url_text(url, max_chars=4000):
         return None, f"Couldn't read that URL: {str(e)[:200]}"
 
 # ============================================
-# DISCORD FILE READING
-# ============================================
-async def read_discord_attachment(attachment, max_chars=10000):
-    """Download and read a text-based file from Discord."""
-    try:
-        safe_extensions = [".txt", ".md", ".csv", ".json", ".py", ".js", ".html", ".css", ".log"]
-        is_safe_ext = any(attachment.filename.lower().endswith(ext) for ext in safe_extensions)
-        is_text = attachment.content_type and "text" in attachment.content_type
-
-        if not (is_safe_ext or is_text):
-            return None, f"Can't read {attachment.filename} — I handle text files (.txt, .md, .csv, .json, .py, .js, .html, .css, .log)."
-
-        content = await attachment.read()
-        text = content.decode("utf-8", errors="replace")
-        if len(text) > max_chars:
-            text = text[:max_chars] + f"\n... [truncated at {max_chars} chars]"
-        return text, None
-    except Exception as e:
-        return None, f"Couldn't read {attachment.filename}: {str(e)[:200]}"
-
-# ============================================
 # AUTONOMOUS SEARCH/READ/LEARN HANDLER
 # ============================================
 async def handle_tool_tags(response_text, db, channel_name, full_messages):
@@ -913,22 +892,11 @@ async def on_message(message):
         history = get_recent_messages(db, channel_name)
         full_messages.extend(history)
 
-        # Current message (with image and file support)
+        # Current message (with image support)
         image_urls = [
             a.url for a in message.attachments
             if a.content_type and a.content_type.startswith("image/")
         ]
-        text_attachments = [
-            a for a in message.attachments
-            if not (a.content_type and a.content_type.startswith("image/"))
-        ]
-
-        # Read any text file attachments
-        file_contents = []
-        for att in text_attachments:
-            file_text, error = await read_discord_attachment(att)
-            if file_text:
-                file_contents.append(f"[Attached file: {att.filename}]\n{file_text}")
 
         if image_urls:
             user_content = []
@@ -937,8 +905,6 @@ async def on_message(message):
                 if content
                 else f"{message.author.display_name} sent an image"
             )
-            if file_contents:
-                text += "\n\n" + "\n\n".join(file_contents)
             user_content.append({"type": "text", "text": text})
             for url in image_urls:
                 user_content.append({
@@ -954,15 +920,12 @@ async def on_message(message):
                 message.author.display_name
             )
         else:
-            msg_text = f"{message.author.display_name}: {content}"
-            if file_contents:
-                msg_text += "\n\n" + "\n\n".join(file_contents)
             full_messages.append({
-                "role": "user", "content": msg_text
+                "role": "user",
+                "content": f"{message.author.display_name}: {content}"
             })
             save_message(
-                db, channel_name, "user",
-                content + (" [file attached]" if file_contents else ""),
+                db, channel_name, "user", content,
                 message.author.display_name
             )
 
