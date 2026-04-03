@@ -305,23 +305,44 @@ def get_cross_channel_messages(db, exclude_channel, limit=CROSS_CHANNEL_WINDOW):
     """Get recent messages from all channels EXCEPT the current one."""
     cursor = db.cursor()
     cursor.execute(
-        "SELECT channel, name, content, role FROM messages "
+        "SELECT channel, name, content, role, timestamp FROM messages "
         "WHERE channel != ? ORDER BY id DESC LIMIT ?",
         (exclude_channel, limit * 3)  # Fetch more, then group by channel
     )
     rows = cursor.fetchall()
     rows.reverse()
 
+    # Figure out relative time labels
+    now = datetime.now()
+
+    def time_ago(ts_str):
+        try:
+            ts = datetime.fromisoformat(ts_str)
+            diff = now - ts
+            minutes = int(diff.total_seconds() / 60)
+            if minutes < 1:
+                return "just now"
+            elif minutes < 60:
+                return f"{minutes}m ago"
+            elif minutes < 1440:
+                return f"{minutes // 60}h ago"
+            else:
+                return f"{minutes // 1440}d ago"
+        except Exception:
+            return ""
+
     # Group by channel, keep only the most recent messages per channel
     channels = {}
-    for channel, name, content, role in rows:
+    for channel, name, content, role, timestamp in rows:
         if channel not in channels:
             channels[channel] = []
         if len(channels[channel]) < limit:
+            ago = time_ago(timestamp)
+            tag = f" [{ago}]" if ago else ""
             if role == "user":
-                channels[channel].append(f"  {name}: {content}" if name else f"  {content}")
+                channels[channel].append(f"  {name}{tag}: {content}" if name else f"  {content}")
             else:
-                channels[channel].append(f"  Ben: {content[:200]}")
+                channels[channel].append(f"  Ben{tag}: {content[:200]}")
 
     return channels
 
