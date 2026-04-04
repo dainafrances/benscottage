@@ -403,4 +403,7 @@ def get_message_count(db):
 def add_user_fact(db, username, fact):
     cursor = db.cursor()
     cursor.execute(
-        "INSERT INTO user_profiles (us
+        "INSERT INTO user_profiles (username, fact, timestamp) VALUES (?, ?, ?)",
+        (username, fact, datetime.now().isoformat())
+    )
+    db.commit()
