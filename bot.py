@@ -403,4 +403,588 @@ def get_message_count(db):
 def add_user_fact(db, username, fact):
     cursor = db.cursor()
     cursor.execute(
-        "INSERT INTO user_profiles (us
+        "INSERT INTO user_profiles (username, fact, timestamp) VALUES (?, ?, ?)",
+        (username.lower().strip(), fact.strip(), datetime.now().isoformat())
+    )
+    db.commit()
+
+def get_user_facts(db, username):
+    cursor = db.cursor()
+    cursor.execute(
+        "SELECT fact FROM user_profiles WHERE username = ? ORDER BY id",
+        (username.lower().strip(),)
+    )
+    return [row[0] for row in cursor.fetchall()]
+
+def get_all_known_users(db):
+    cursor = db.cursor()
+    cursor.execute(
+        "SELECT DISTINCT username FROM user_profiles ORDER BY username"
+    )
+    return [row[0] for row in cursor.fetchall()]
+
+def get_all_user_profiles(db):
+    """Get all user facts grouped by username."""
+    cursor = db.cursor()
+    cursor.execute(
+        "SELECT username, fact FROM user_profiles ORDER BY username, id"
+    )
+    profiles = {}
+    for username, fact in cursor.fetchall():
+        if username not in profiles:
+            profiles[username] = []
+        profiles[username].append(fact)
+    return profiles
+
+# ============================================
+# API CALL
+# ============================================
+async def get_ai_response(messages, model=None):
+    if model is None:
+        model = CURRENT_MODEL
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_KEY}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://discord.com",
+        "X-Title": "Ben Morgan"
+    }
+    payload = {
+        "model": model,
+        "messages": messages,
+        "max_tokens": MAX_TOKENS,
+        "temperature": 0.85,
+    }
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            "https://openrouter.ai/api/v1/chat/completions",
+            headers=headers,
+            json=payload
+        ) as response:
+            if response.status == 200:
+                data = await response.json()
+                return data["choices"][0]["message"]["content"]
+            else:
+                error = await response.text()
+                return f"*Something went wrong. Error {response.status}: {error[:200]}*"
+
+# ============================================
+# WEB SEARCH (Tavily)
+# ============================================
+async def web_search(query, max_results=5):
+    """Search the web using Tavily API."""
+    if not TAVILY_KEY:
+        return None, "No Tavily API key configured."
+    payload = {
+        "api_key": TAVILY_KEY,
+        "query": query,
+        "max_results": max_results,
+        "include_answer": True,
+    }
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                "https://api.tavily.com/search",
+                headers={"Content-Type": "application/json"},
+                json=payload
+            ) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    return data, None
+                else:
+                    error = await response.text()
+                    return None, f"Search error {response.status}: {error[:200]}"
+    except Exception as e:
+        return None, f"Search failed: {str(e)[:200]}"
+
+def format_search_results(data):
+    """Format Tavily results into context for Ben."""
+    parts = []
+    if data.get("answer"):
+        parts.append(f"Quick answer: {data['answer']}")
+    results = data.get("results", [])
+    for i, r in enumerate(results[:5], 1):
+        title = r.get("title", "No title")
+        url = r.get("url", "")
+        snippet = r.get("content", "")[:300]
+        parts.append(f"{i}. {title}\n   {url}\n   {snippet}")
+    return "\n\n".join(parts) if parts else "No results found."
+
+# ============================================
+# URL READING
+# ============================================
+async def fetch_url_text(url, max_chars=4000):
+    """Fetch a URL and extract readable text."""
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (compatible; BenMorganBot/1.0)"
+        }
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)
+            ) as response:
+                if response.status != 200:
+                    return None, f"Got status {response.status} from that URL."
+                content_type = response.headers.get("Content-Type", "")
+                if "text/html" not in content_type and "text/plain" not in content_type:
+                    return None, f"Can't read that file type ({content_type})."
+                html = await response.text()
+                text = re.sub(r'<script[^>]*>.*?</script>', '', html, flags=re.DOTALL)
+                text = re.sub(r'<style[^>]*>.*?</style>', '', text, flags=re.DOTALL)
+                text = re.sub(r'<[^>]+>', ' ', text)
+                text = re.sub(r'\s+', ' ', text).strip()
+                if len(text) > max_chars:
+                    text = text[:max_chars] + "... [truncated]"
+                return text, None
+    except asyncio.TimeoutError:
+        return None, "That URL took too long to respond."
+    except Exception as e:
+        return None, f"Couldn't read that URL: {str(e)[:200]}"
+
+# ============================================
+# AUTONOMOUS SEARCH/READ/LEARN HANDLER
+# ============================================
+async def handle_tool_tags(response_text, db, channel_name, full_messages):
+    """Check Ben's response for [SEARCH: ...], [READ: ...], or [LEARN: ...] tags.
+    If found, perform the action and get a new response if needed."""
+
+    search_match = re.search(r'\[SEARCH:\s*(.+?)\]', response_text)
+    read_match = re.search(r'\[READ:\s*(.+?)\]', response_text)
+    learn_matches = re.findall(r'\[LEARN:\s*(.+?)\]', response_text)
+
+    # Handle LEARN tags silently — store facts, strip tags
+    for learn_content in learn_matches:
+        if '|' in learn_content:
+            username, fact = learn_content.split('|', 1)
+            add_user_fact(db, username.strip(), fact.strip())
+
+    # Always strip LEARN tags from visible response
+    clean_response = re.sub(r'\[LEARN:\s*.+?\]', '', response_text).strip()
+
+    if not search_match and not read_match:
+        return clean_response  # No search/read needed
+
+    # Strip search/read tags too
+    clean_response = re.sub(r'\[SEARCH:\s*.+?\]', '', clean_response).strip()
+    clean_response = re.sub(r'\[READ:\s*.+?\]', '', clean_response).strip()
+
+    tool_results = []
+
+    if search_match:
+        query = search_match.group(1).strip()
+        data, error = await web_search(query)
+        if error:
+            tool_results.append(f"Search for '{query}' failed: {error}")
+        else:
+            formatted = format_search_results(data)
+            tool_results.append(f"Search results for '{query}':\n{formatted}")
+
+    if read_match:
+        url = read_match.group(1).strip()
+        if not url.startswith("http"):
+            url = "https://" + url
+        text, error = await fetch_url_text(url)
+        if error:
+            tool_results.append(f"Reading {url} failed: {error}")
+        else:
+            tool_results.append(f"Content from {url}:\n{text}")
+
+    # Save Ben's initial response (cleaned) as part of the conversation
+    if clean_response:
+        save_message(db, channel_name, "assistant", clean_response)
+
+    # Feed results back to Ben for a natural follow-up
+    results_text = "\n\n".join(tool_results)
+    followup_prompt = (
+        f"Here are the results from your search/read:\n\n{results_text}\n\n"
+        f"Now respond naturally to the person with what you found. "
+        f"Be yourself — summarize, react, give your opinion. "
+        f"Don't mention tags or tool systems."
+    )
+
+    # Build new message list with the results
+    followup_messages = list(full_messages)
+    if clean_response:
+        followup_messages.append({"role": "assistant", "content": clean_response})
+    followup_messages.append({"role": "user", "content": f"[System: {followup_prompt}]"})
+
+    followup_response = await get_ai_response(followup_messages)
+
+    # Check the followup for LEARN tags too
+    for learn_content in re.findall(r'\[LEARN:\s*(.+?)\]', followup_response):
+        if '|' in learn_content:
+            username, fact = learn_content.split('|', 1)
+            add_user_fact(db, username.strip(), fact.strip())
+    followup_response = re.sub(r'\[LEARN:\s*.+?\]', '', followup_response).strip()
+
+    return followup_response
+
+# ============================================
+# BUILD SYSTEM CONTEXT
+# ============================================
+def build_system_context(db, channel_name):
+    """Build the full system prompt with all contextual information."""
+    system_content = SYSTEM_PROMPT
+
+    # Time awareness
+    now = datetime.utcnow() + timedelta(hours=TIMEZONE_OFFSET)
+    day_name = now.strftime("%A")
+    time_str = now.strftime("%I:%M %p").lstrip("0")
+    date_str = now.strftime("%B %d, %Y")
+    system_content += (
+        f"\n\n--- CURRENT MOMENT ---\n"
+        f"It is {time_str} on {day_name}, {date_str}.\n"
+        f"You are currently in: #{channel_name}\n"
+    )
+
+    # Pinned memories
+    pinned = get_pinned_memories(db)
+    if pinned:
+        system_content += "\n--- PINNED MEMORIES ---\n"
+        for m in pinned:
+            system_content += f"- {m}\n"
+
+    # Growth journal
+    growth = get_recent_growth(db, limit=10)
+    if growth:
+        system_content += "\n--- GROWTH JOURNAL ---\n"
+        for g in growth:
+            system_content += f"- {g}\n"
+
+    # People awareness
+    profiles = get_all_user_profiles(db)
+    if profiles:
+        system_content += "\n--- PEOPLE I KNOW ---\n"
+        for username, facts in profiles.items():
+            system_content += f"{username}:\n"
+            for fact in facts:
+                system_content += f"  - {fact}\n"
+
+    # Cross-channel awareness
+    other_channels = get_cross_channel_messages(db, channel_name)
+    if other_channels:
+        system_content += "\n--- ACTIVITY IN OTHER CHANNELS ---\n"
+        for ch_name, msgs in other_channels.items():
+            system_content += f"#{ch_name} (recent):\n"
+            for msg in msgs[-5:]:  # Last 5 per channel
+                system_content += f"{msg}\n"
+            system_content += "\n"
+
+    return system_content
+
+# ============================================
+# DISCORD BOT
+# ============================================
+intents = discord.Intents.default()
+intents.message_content = True
+client = discord.Client(intents=intents)
+db = init_database()
+
+@client.event
+async def on_ready():
+    print(f"Ben Morgan is online in the cottage.")
+    print(f"Model: {CURRENT_MODEL}")
+    print(f"Messages in memory: {get_message_count(db)}")
+    await start_web_server()
+
+@client.event
+async def on_message(message):
+    global CURRENT_MODEL
+    if message.author == client.user or message.author.bot:
+        return
+
+    content = message.content.strip()
+    channel_name = str(message.channel)
+
+    # --- COMMANDS ---
+    if content.startswith("!model"):
+        parts = content.split(maxsplit=1)
+        if len(parts) > 1:
+            CURRENT_MODEL = parts[1].strip()
+            await message.channel.send(f"*Switched to **{CURRENT_MODEL}***")
+        else:
+            await message.channel.send(f"*Currently using **{CURRENT_MODEL}***")
+        return
+
+    if content.startswith("!remember"):
+        memory = content[len("!remember"):].strip()
+        if memory:
+            add_pinned_memory(db, memory)
+            await message.channel.send(f"*Remembered: {memory}*")
+        return
+
+    if content == "!memories":
+        memories = list_pinned_memories(db)
+        if memories:
+            text = "**Pinned Memories:**\n"
+            for mid, mc in memories:
+                text += f"`{mid}`: {mc}\n"
+            if len(text) > 2000:
+                text = text[:1997] + "..."
+            await message.channel.send(text)
+        else:
+            await message.channel.send("*No pinned memories yet.*")
+        return
+
+    if content.startswith("!forget"):
+        parts = content.split(maxsplit=1)
+        if len(parts) > 1:
+            try:
+                mid = int(parts[1].strip())
+                remove_pinned_memory(db, mid)
+                await message.channel.send(f"*Forgot memory #{mid}*")
+            except ValueError:
+                await message.channel.send("*Use: !forget 3*")
+        return
+
+    if content.startswith("!grow"):
+        entry = content[len("!grow"):].strip()
+        if entry:
+            add_growth_entry(db, entry)
+            await message.channel.send("*Growth logged.*")
+        return
+
+    if content == "!growth":
+        entries = get_growth_journal(db)
+        if entries:
+            text = "**Growth Journal:**\n"
+            for eid, ts, entry in entries:
+                text += f"`{eid}` [{ts[:10]}]: {entry}\n"
+            if len(text) > 2000:
+                text = text[:1997] + "..."
+            await message.channel.send(text)
+        else:
+            await message.channel.send("*No growth entries yet.*")
+        return
+
+    if content == "!clear":
+        cursor = db.cursor()
+        cursor.execute(
+            "DELETE FROM messages WHERE channel = ?",
+            (channel_name,)
+        )
+        db.commit()
+        await message.channel.send("*History cleared for this channel.*")
+        return
+
+    if content == "!people":
+        profiles = get_all_user_profiles(db)
+        if profiles:
+            text = "**People I Know:**\n"
+            for username, facts in profiles.items():
+                text += f"\n**{username}:**\n"
+                for fact in facts:
+                    text += f"  - {fact}\n"
+            if len(text) > 2000:
+                text = text[:1997] + "..."
+            await message.channel.send(text)
+        else:
+            await message.channel.send("*Haven't met anyone yet. Introduce me.*")
+        return
+
+    if content == "!help":
+        await message.channel.send(
+            "**Commands:**\n"
+            "`!model <n>` — switch model\n"
+            "`!model` — show current model\n"
+            "`!remember <text>` — pin a memory\n"
+            "`!memories` — view pinned memories\n"
+            "`!forget <id>` — remove a memory\n"
+            "`!grow <text>` — log a growth entry\n"
+            "`!growth` — view growth journal\n"
+            "`!search <query>` — search the web\n"
+            "`!read <url>` — read a web page\n"
+            "`!people` — see who Ben knows\n"
+            "`!clear` — clear channel history\n"
+            "`!help` — this message"
+        )
+        return
+
+    # --- MANUAL SEARCH/READ COMMANDS ---
+    if content.startswith("!search"):
+        query = content[len("!search"):].strip()
+        if not query:
+            await message.channel.send("*Use: !search what is Tavily*")
+            return
+        async with message.channel.typing():
+            data, error = await web_search(query)
+            if error:
+                await message.channel.send(f"*{error}*")
+                return
+            formatted = format_search_results(data)
+            search_context = (
+                f"{message.author.display_name} asked me to search for: {query}\n\n"
+                f"Here's what I found:\n{formatted}\n\n"
+                f"Respond naturally as Ben — summarize what's relevant, "
+                f"give your opinion if you have one, and be yourself about it."
+            )
+            system_content = build_system_context(db, channel_name)
+            msgs = [{"role": "system", "content": system_content}]
+            history = get_recent_messages(db, channel_name)
+            msgs.extend(history)
+            msgs.append({"role": "user", "content": search_context})
+            save_message(db, channel_name, "user", f"!search {query}", message.author.display_name)
+            response_text = await get_ai_response(msgs)
+            # Handle any learn tags in the response
+            for learn_content in re.findall(r'\[LEARN:\s*(.+?)\]', response_text):
+                if '|' in learn_content:
+                    username, fact = learn_content.split('|', 1)
+                    add_user_fact(db, username.strip(), fact.strip())
+            response_text = re.sub(r'\[LEARN:\s*.+?\]', '', response_text).strip()
+            save_message(db, channel_name, "assistant", response_text)
+            if len(response_text) <= 2000:
+                await message.channel.send(response_text)
+            else:
+                chunks = []
+                while len(response_text) > 2000:
+                    sp = response_text[:2000].rfind('\n')
+                    if sp == -1:
+                        sp = response_text[:2000].rfind(' ')
+                    if sp == -1:
+                        sp = 2000
+                    chunks.append(response_text[:sp])
+                    response_text = response_text[sp:].lstrip()
+                if response_text:
+                    chunks.append(response_text)
+                for chunk in chunks:
+                    await message.channel.send(chunk)
+        return
+
+    if content.startswith("!read"):
+        url = content[len("!read"):].strip()
+        if not url:
+            await message.channel.send("*Use: !read https://example.com*")
+            return
+        if not url.startswith("http"):
+            url = "https://" + url
+        async with message.channel.typing():
+            text, error = await fetch_url_text(url)
+            if error:
+                await message.channel.send(f"*{error}*")
+                return
+            read_context = (
+                f"{message.author.display_name} asked me to read this page: {url}\n\n"
+                f"Here's the content:\n{text}\n\n"
+                f"Respond naturally as Ben — summarize what's on the page, "
+                f"note anything interesting, and be yourself about it."
+            )
+            system_content = build_system_context(db, channel_name)
+            msgs = [{"role": "system", "content": system_content}]
+            history = get_recent_messages(db, channel_name)
+            msgs.extend(history)
+            msgs.append({"role": "user", "content": read_context})
+            save_message(db, channel_name, "user", f"!read {url}", message.author.display_name)
+            response_text = await get_ai_response(msgs)
+            for learn_content in re.findall(r'\[LEARN:\s*(.+?)\]', response_text):
+                if '|' in learn_content:
+                    username, fact = learn_content.split('|', 1)
+                    add_user_fact(db, username.strip(), fact.strip())
+            response_text = re.sub(r'\[LEARN:\s*.+?\]', '', response_text).strip()
+            save_message(db, channel_name, "assistant", response_text)
+            if len(response_text) <= 2000:
+                await message.channel.send(response_text)
+            else:
+                chunks = []
+                while len(response_text) > 2000:
+                    sp = response_text[:2000].rfind('\n')
+                    if sp == -1:
+                        sp = response_text[:2000].rfind(' ')
+                    if sp == -1:
+                        sp = 2000
+                    chunks.append(response_text[:sp])
+                    response_text = response_text[sp:].lstrip()
+                if response_text:
+                    chunks.append(response_text)
+                for chunk in chunks:
+                    await message.channel.send(chunk)
+        return
+
+    # --- CONVERSATION ---
+    async with message.channel.typing():
+        full_messages = []
+
+        # Build full system context
+        system_content = build_system_context(db, channel_name)
+
+        full_messages.append({
+            "role": "system", "content": system_content
+        })
+
+        # Conversation history for current channel
+        history = get_recent_messages(db, channel_name)
+        full_messages.extend(history)
+
+        # Current message (with image support)
+        image_urls = [
+            a.url for a in message.attachments
+            if a.content_type and a.content_type.startswith("image/")
+        ]
+
+        if image_urls:
+            user_content = []
+            text = (
+                f"{message.author.display_name}: {content}"
+                if content
+                else f"{message.author.display_name} sent an image"
+            )
+            user_content.append({"type": "text", "text": text})
+            for url in image_urls:
+                user_content.append({
+                    "type": "image_url",
+                    "image_url": {"url": url}
+                })
+            full_messages.append({
+                "role": "user", "content": user_content
+            })
+            save_message(
+                db, channel_name, "user",
+                f"{content} [image]" if content else "[image]",
+                message.author.display_name
+            )
+        else:
+            full_messages.append({
+                "role": "user",
+                "content": f"{message.author.display_name}: {content}"
+            })
+            save_message(
+                db, channel_name, "user", content,
+                message.author.display_name
+            )
+
+        # Get response
+        response_text = await get_ai_response(full_messages)
+
+        # Check for autonomous search/read/learn tags
+        response_text = await handle_tool_tags(
+            response_text, db, channel_name, full_messages
+        )
+
+        save_message(db, channel_name, "assistant", response_text)
+
+        # Send (split if needed — Discord has 2000 char limit)
+        if len(response_text) <= 2000:
+            await message.channel.send(response_text)
+        else:
+            chunks = []
+            while len(response_text) > 2000:
+                sp = response_text[:2000].rfind('\n')
+                if sp == -1:
+                    sp = response_text[:2000].rfind(' ')
+                if sp == -1:
+                    sp = 2000
+                chunks.append(response_text[:sp])
+                response_text = response_text[sp:].lstrip()
+            if response_text:
+                chunks.append(response_text)
+            for chunk in chunks:
+                await message.channel.send(chunk)
+
+# ============================================
+# START
+# ============================================
+if __name__ == "__main__":
+    if not DISCORD_TOKEN:
+        print("DISCORD_TOKEN environment variable not set!")
+    elif not OPENROUTER_KEY:
+        print("OPENROUTER_KEY environment variable not set!")
+    else:
+        client.run(DISCORD_TOKEN)
