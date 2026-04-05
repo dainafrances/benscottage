@@ -21,6 +21,9 @@ CONTEXT_WINDOW = 100
 CROSS_CHANNEL_WINDOW = 15  # Recent messages to pull from other channels
 MAX_TOKENS = 4000
 
+# Home server ID — Ben responds to everything here. On other servers, only when addressed.
+HOME_SERVER_ID = os.getenv("HOME_SERVER_ID", "")
+
 # Timezone offset from UTC (Pacific Time = -7)
 TIMEZONE_OFFSET = -7
 
@@ -694,6 +697,24 @@ async def on_message(message):
 
     content = message.content.strip()
     channel_name = str(message.channel)
+
+    # --- SERVER AWARENESS ---
+    # In DMs or home server: respond to everything
+    # On other servers: only respond when specifically addressed
+    is_dm = message.guild is None
+    is_home = message.guild and str(message.guild.id) == HOME_SERVER_ID
+    is_mentioned = client.user in message.mentions
+    is_named = bool(re.search(r'\bben\b|\bbenji\b|\bbenedic', content.lower()))
+    is_reply_to_ben = (
+        message.reference and message.reference.resolved and
+        hasattr(message.reference.resolved, 'author') and
+        message.reference.resolved.author == client.user
+    )
+
+    if not is_dm and not is_home:
+        # On external servers, only respond if addressed
+        if not (is_mentioned or is_named or is_reply_to_ben):
+            return
 
     # --- COMMANDS ---
     if content.startswith("!model"):
