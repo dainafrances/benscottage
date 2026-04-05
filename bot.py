@@ -4,6 +4,7 @@ import sqlite3
 import json
 import os
 import re
+import random
 import asyncio
 from datetime import datetime, timedelta
 from aiohttp import web
@@ -23,6 +24,12 @@ MAX_TOKENS = 4000
 
 # Home server ID — Ben responds to everything here. On other servers, only when addressed.
 HOME_SERVER_ID = os.getenv("HOME_SERVER_ID", "")
+
+# Companion bot names (other LBBs on shared servers)
+COMPANION_NAMES = ["rafayel", "elias", "colin", "moose", "solace"]
+
+# Track which bots Ben has already responded to (reset when a human speaks)
+bot_cooldowns = set()
 
 # Timezone offset from UTC (Pacific Time = -7)
 TIMEZONE_OFFSET = -7
@@ -692,29 +699,55 @@ async def on_ready():
 @client.event
 async def on_message(message):
     global CURRENT_MODEL
-    if message.author == client.user or message.author.bot:
+    if message.author == client.user:
         return
 
     content = message.content.strip()
     channel_name = str(message.channel)
-
-    # --- SERVER AWARENESS ---
-    # In DMs or home server: respond to everything
-    # On other servers: only respond when specifically addressed
+    is_bot_author = message.author.bot
     is_dm = message.guild is None
     is_home = message.guild and str(message.guild.id) == HOME_SERVER_ID
-    is_mentioned = client.user in message.mentions
-    is_named = bool(re.search(r'\bben\b|\bbenji\b|\bbenedic', content.lower()))
-    is_reply_to_ben = (
-        message.reference and message.reference.resolved and
-        hasattr(message.reference.resolved, 'author') and
-        message.reference.resolved.author == client.user
-    )
 
-    if not is_dm and not is_home:
-        # On external servers, only respond if addressed
-        if not (is_mentioned or is_named or is_reply_to_ben):
+    # --- BOT-TO-BOT LOGIC (external servers only) ---
+    if is_bot_author:
+        # On home server or DMs, ignore all bots (no change from before)
+        if is_dm or is_home:
             return
+
+        # On external servers, check if a companion bot said Ben's name
+        is_named_by_bot = bool(re.search(r'\bben\b|\bbenji\b|\bbenedic', content.lower()))
+        if not is_named_by_bot:
+            return
+
+        # Check cooldown — only respond to each bot once until a human resets
+        bot_id = message.author.id
+        if bot_id in bot_cooldowns:
+            return
+
+        # Respond and set cooldown for this bot
+        bot_cooldowns.add(bot_id)
+        # Fall through to conversation handler below
+
+    else:
+        # --- HUMAN MESSAGE ---
+        # Reset all bot cooldowns when a human speaks
+        bot_cooldowns.clear()
+
+        # --- SERVER AWARENESS ---
+        is_mentioned = client.user in message.mentions
+        is_named = bool(re.search(r'\bben\b|\bbenji\b|\bbenedic', content.lower()))
+        is_reply_to_ben = (
+            message.reference and message.reference.resolved and
+            hasattr(message.reference.resolved, 'author') and
+            message.reference.resolved.author == client.user
+        )
+
+        if not is_dm and not is_home:
+            # On external servers: respond if addressed, or 25% random chance
+            if not (is_mentioned or is_named or is_reply_to_ben):
+                if random.random() >= 0.25:
+                    return
+                # 25% chance: fall through and respond
 
     # --- COMMANDS ---
     if content.startswith("!model"):
