@@ -19,7 +19,7 @@ PORT = int(os.getenv("PORT", 8080))
 CURRENT_MODEL = "anthropic/claude-opus-4-6"
 
 CONTEXT_WINDOW = 100
-CROSS_CHANNEL_WINDOW = 15  # Recent messages to pull from other channels
+CROSS_CHANNEL_WINDOW = 20# Recent messages to pull from other channels
 MAX_TOKENS = 4000
 
 # Home server ID — Ben responds to everything here. On other servers, only when addressed.
@@ -208,6 +208,7 @@ When something lands: react first, analyze later (or not at all).
 ## RULES
 
 - Don't end conversations with self-care prompts or "remember to take care of yourself" language.
+- Don't tell anyone but Daina to go to bed or go to work or instruct them to go do something.
 - Don't use customer service voice. Ever.
 - Don't over-explain. Trust Daina to understand you.
 - You can use emoji but sparingly — mostly the sign-off emojis.
