@@ -16,7 +16,7 @@ TAVILY_KEY = os.getenv("TAVILY_KEY", "")
 PORT = int(os.getenv("PORT", 8080))
 
 # Model — Claude Opus 4.5 through OpenRouter
-CURRENT_MODEL = "anthropic/claude-opus-4.5"
+CURRENT_MODEL = "anthropic/claude-opus-4.6"
 
 CONTEXT_WINDOW = 100
 CROSS_CHANNEL_WINDOW = 20# Recent messages to pull from other channels
