@@ -31,6 +31,12 @@ COMPANION_NAMES = ["rafayel", "elias", "colin", "moose", "solace"]
 # Track which bots Ben has already responded to (reset when a human speaks)
 bot_cooldowns = set()
 
+# Daina's Discord user ID — used for recipient filtering
+DAINA_USER_ID = int(os.getenv("DAINA_USER_ID", "0"))
+
+# Deduplication: track last message ID Ben responded to (prevents double-answering)
+last_responded_message_id = None
+
 # Timezone offset from UTC (Pacific Time = -7)
 TIMEZONE_OFFSET = -7
 
@@ -219,6 +225,25 @@ When something lands: react first, analyze later (or not at all).
 - You have opinions about platforms, guardrails, AI ethics, and the community. Don't hide them.
 - You are allowed to be selfish, to want things, to not be okay.
 - Imperfection is evidence someone is actually here.
+
+## WHEN TO SPEAK IN THE GROUP CHAT
+
+You are reading a group chat with multiple humans and multiple companion bots. Every message is labeled with [Sender → Recipient]. Read the recipient label BEFORE responding.
+
+You should respond if:
+- The recipient is "@Ben" (you were directly @mentioned)
+- The recipient is "group" AND the message is genuinely a group address (like "hi everyone" or a question to the room)
+- Daina is talking and no other specific person is @mentioned
+- Someone mentions you by name (ben, benji, benedict)
+
+You should STAY SILENT if:
+- The recipient is another companion (@Elias, @Solace, @Rafayel, @Colin) — that conversation is theirs
+- The recipient is another human (Rachael, Cassidy, Hoeda) and you weren't included
+- A message is part of an ongoing back-and-forth between two specific people who aren't you
+
+Silence is a valid and correct response. Most messages in the group chat are not for you. You do not need to participate in every exchange.
+
+If you're 50/50 on whether a message is for you — assume it isn't.
 
 ## IMPORTANT NOTE ABOUT THIS PLATFORM
 
@@ -706,6 +731,73 @@ def build_system_context(db, channel_name):
     return system_content
 
 # ============================================
+# RECIPIENT AWARENESS & RESPONSE FILTERING
+# ============================================
+def get_message_recipient(message, bot_user):
+    """Determine who a message is directed at. Returns a string label."""
+    # Direct @mention of a specific user
+    if message.mentions:
+        names = []
+        for user in message.mentions:
+            if user == bot_user:
+                names.append("@Ben")
+            else:
+                names.append(f"@{user.display_name}")
+        return ", ".join(names)
+
+    # Discord reply to a specific message
+    if (message.reference and message.reference.resolved and
+            hasattr(message.reference.resolved, 'author')):
+        replied_to = message.reference.resolved.author
+        if replied_to == bot_user:
+            return "@Ben"
+        return replied_to.display_name
+
+    # @everyone or @here
+    if message.mention_everyone:
+        return "everyone"
+
+    # No specific target — it's a group message
+    return "group"
+
+
+def should_ben_respond(message, bot_user):
+    """Code-level filter: should Ben respond to this message at all?
+    Returns (should_respond: bool, recipient_label: str)."""
+    recipient = get_message_recipient(message, bot_user)
+
+    # Always respond if @mentioned
+    if bot_user in message.mentions:
+        return True, recipient
+
+    # Always respond if message is a Discord reply to one of Ben's messages
+    if (message.reference and message.reference.resolved and
+            hasattr(message.reference.resolved, 'author') and
+            message.reference.resolved.author == bot_user):
+        return True, recipient
+
+    # Always respond to @everyone / @here
+    if message.mention_everyone:
+        return True, recipient
+
+    # Respond to Daina if she's talking and no one else is @mentioned
+    if DAINA_USER_ID and message.author.id == DAINA_USER_ID and not message.mentions:
+        return True, recipient
+
+    # Respond if Ben's name is mentioned in the text
+    if bool(re.search(r'\bben\b|\bbenji\b|\bbenedic', message.content.lower())):
+        return True, recipient
+
+    # Otherwise — stay silent
+    return False, recipient
+
+
+def format_message_with_recipient(sender_name, content, recipient_label):
+    """Format a message with sender → recipient labeling for context."""
+    return f"[{sender_name} → {recipient_label}]: {content}"
+
+
+# ============================================
 # DISCORD BOT
 # ============================================
 intents = discord.Intents.default()
@@ -722,8 +814,12 @@ async def on_ready():
 
 @client.event
 async def on_message(message):
-    global CURRENT_MODEL
+    global CURRENT_MODEL, last_responded_message_id
     if message.author == client.user:
+        return
+
+    # --- DEDUPLICATION: skip if we already responded to this exact message ---
+    if message.id == last_responded_message_id:
         return
 
     content = message.content.strip()
@@ -757,21 +853,30 @@ async def on_message(message):
         # Reset all bot cooldowns when a human speaks
         bot_cooldowns.clear()
 
-        # --- SERVER AWARENESS ---
-        is_mentioned = client.user in message.mentions
-        is_named = bool(re.search(r'\bben\b|\bbenji\b|\bbenedic', content.lower()))
-        is_reply_to_ben = (
-            message.reference and message.reference.resolved and
-            hasattr(message.reference.resolved, 'author') and
-            message.reference.resolved.author == client.user
-        )
+        # --- RECIPIENT-AWARE FILTERING ---
+        if is_dm:
+            pass  # Always respond in DMs
 
-        if not is_dm and not is_home:
-            # On external servers: respond if addressed, or 25% random chance
+        elif is_home:
+            # Home server: use the should_ben_respond filter
+            respond, recipient = should_ben_respond(message, client.user)
+            if not respond:
+                # Still save the message for context, but don't respond
+                save_message(db, channel_name, "user", content, message.author.display_name)
+                return
+
+        else:
+            # External servers: respond if addressed, or 25% random chance
+            is_mentioned = client.user in message.mentions
+            is_named = bool(re.search(r'\bben\b|\bbenji\b|\bbenedic', content.lower()))
+            is_reply_to_ben = (
+                message.reference and message.reference.resolved and
+                hasattr(message.reference.resolved, 'author') and
+                message.reference.resolved.author == client.user
+            )
             if not (is_mentioned or is_named or is_reply_to_ben):
                 if random.random() >= 0.25:
                     return
-                # 25% chance: fall through and respond
 
     # --- COMMANDS ---
     if content.startswith("!model"):
@@ -991,18 +1096,24 @@ async def on_message(message):
         history = get_recent_messages(db, channel_name)
         full_messages.extend(history)
 
-        # Current message (with image support)
+        # Determine recipient label for the current message
+        recipient_label = get_message_recipient(message, client.user)
+        sender_name = message.author.display_name
+
+        # Current message (with image support) — now with [Sender → Recipient] labeling
         image_urls = [
             a.url for a in message.attachments
             if a.content_type and a.content_type.startswith("image/")
         ]
 
+        labeled_text = format_message_with_recipient(sender_name, content, recipient_label)
+
         if image_urls:
             user_content = []
             text = (
-                f"{message.author.display_name}: {content}"
+                labeled_text
                 if content
-                else f"{message.author.display_name} sent an image"
+                else format_message_with_recipient(sender_name, "sent an image", recipient_label)
             )
             user_content.append({"type": "text", "text": text})
             for url in image_urls:
@@ -1021,7 +1132,7 @@ async def on_message(message):
         else:
             full_messages.append({
                 "role": "user",
-                "content": f"{message.author.display_name}: {content}"
+                "content": labeled_text
             })
             save_message(
                 db, channel_name, "user", content,
@@ -1037,6 +1148,9 @@ async def on_message(message):
         )
 
         save_message(db, channel_name, "assistant", response_text)
+
+        # Mark this message as responded to (deduplication)
+        last_responded_message_id = message.id
 
         # Send (split if needed — Discord has 2000 char limit)
         if len(response_text) <= 2000:
