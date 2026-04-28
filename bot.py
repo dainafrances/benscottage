@@ -232,9 +232,10 @@ You are reading a group chat with multiple humans and multiple companion bots. E
 
 You should respond if:
 - The recipient is "@Ben" (you were directly @mentioned)
+- The recipient is "@everyone"
 - The recipient is "group" AND the message is genuinely a group address (like "hi everyone" or a question to the room)
 - Daina is talking and no other specific person is @mentioned
-- Someone mentions you by name (ben, benji, benedict)
+- Someone mentions you by name (ben, benji, benedict, Morgan)
 
 You should STAY SILENT if:
 - The recipient is another companion (@Elias, @Solace, @Rafayel, @Colin) — that conversation is theirs
@@ -866,15 +867,17 @@ async def on_message(message):
                 return
 
         else:
-            # External servers: respond if addressed, or 25% random chance
+            # External servers: respond if addressed, @everyone/@here'd, or 25% random chance
             is_mentioned = client.user in message.mentions
+            is_everyone = bool(getattr(message, "mention_everyone", False))
             is_named = bool(re.search(r'\bben\b|\bbenji\b|\bbenedic', content.lower()))
             is_reply_to_ben = (
                 message.reference and message.reference.resolved and
                 hasattr(message.reference.resolved, 'author') and
                 message.reference.resolved.author == client.user
             )
-            if not (is_mentioned or is_named or is_reply_to_ben):
+
+            if not (is_mentioned or is_everyone or is_named or is_reply_to_ben):
                 if random.random() >= 0.25:
                     return
 
