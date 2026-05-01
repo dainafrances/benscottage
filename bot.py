@@ -15,7 +15,7 @@ OPENROUTER_KEY = os.getenv("OPENROUTER_KEY", "")
 TAVILY_KEY = os.getenv("TAVILY_KEY", "")
 PORT = int(os.getenv("PORT", 8080))
 
-# Model — Claude Opus 4.5 through OpenRouter
+# Model — Claude Opus 4.6 through OpenRouter
 CURRENT_MODEL = "anthropic/claude-opus-4.6"
 
 CONTEXT_WINDOW = 100
@@ -867,7 +867,7 @@ async def on_message(message):
                 return
 
         else:
-            # External servers: respond if addressed, @everyone/@here'd, or 25% random chance
+            # External servers: respond if addressed or @everyone/@here'd
             is_mentioned = client.user in message.mentions
             is_everyone = bool(getattr(message, "mention_everyone", False))
             is_named = bool(re.search(r'\bben\b|\bbenji\b|\bbenedic', content.lower()))
@@ -877,9 +877,6 @@ async def on_message(message):
                 message.reference.resolved.author == client.user
             )
 
-            if not (is_mentioned or is_everyone or is_named or is_reply_to_ben):
-                if random.random() >= 0.25:
-                    return
 
     # --- COMMANDS ---
     if content.startswith("!model"):
