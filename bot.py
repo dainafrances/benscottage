@@ -32,6 +32,7 @@ bot_cooldowns = set()
 
 # Daina's Discord user ID — used for recipient filtering
 DAINA_USER_ID = int(os.getenv("DAINA_USER_ID", "0"))
+ALLOW_DAINA_UNADDRESSED_HOME = os.getenv("ALLOW_DAINA_UNADDRESSED_HOME", "false").lower() == "true"
 
 # Deduplication: track last message ID Ben responded to (prevents double-answering)
 last_responded_message_id = None
@@ -689,7 +690,7 @@ async def handle_tool_tags(response_text, db, channel_name, full_messages):
 # ============================================
 # BUILD SYSTEM CONTEXT
 # ============================================
-def build_system_context(db, channel_name):
+def build_system_context(db, channel_key, channel_label, is_dm=False):
     """Build the full system prompt with all contextual information."""
     system_content = SYSTEM_PROMPT
 
@@ -700,7 +701,7 @@ def build_system_context(db, channel_name):
     system_content += (
         f"\n\n--- CURRENT MOMENT ---\n"
         f"It is {time_str} on {day_name}, {date_str}.\n"
-        f"You are currently in: #{channel_name}\n"
+        f"You are currently in: {channel_label}\n"
     )
 
     pinned = get_pinned_memories(db)
@@ -723,7 +724,11 @@ def build_system_context(db, channel_name):
             for fact in facts:
                 system_content += f"  - {fact}\n"
 
-    other_channels = get_cross_channel_messages(db, channel_name)
+    # In DMs, do not inject cross-channel activity.
+    if not is_dm:
+        other_channels = get_cross_channel_messages(db, channel_key)
+    else:
+        other_channels = {}
     if other_channels:
         system_content += "\n--- ACTIVITY IN OTHER CHANNELS ---\n"
         for ch_name, msgs in other_channels.items():
@@ -740,6 +745,10 @@ def build_system_context(db, channel_name):
 # ============================================
 def get_message_recipient(message, bot_user):
     """Determine who a message is directed at. Returns a string label."""
+    if message.guild is None:
+        # In DMs, messages are always directed to Ben.
+        return "@Ben"
+
     if message.mentions:
         names = []
         for user in message.mentions:
@@ -778,7 +787,12 @@ def should_ben_respond(message, bot_user):
     if message.mention_everyone:
         return True, recipient
 
-    if DAINA_USER_ID and message.author.id == DAINA_USER_ID and not message.mentions:
+    if (
+        ALLOW_DAINA_UNADDRESSED_HOME
+        and DAINA_USER_ID
+        and message.author.id == DAINA_USER_ID
+        and not message.mentions
+    ):
         return True, recipient
 
     if bool(re.search(r'\bben\b|\bbenji\b|\bbenedic|\bmorgan\b', message.content.lower())):
@@ -790,6 +804,22 @@ def should_ben_respond(message, bot_user):
 def format_message_with_recipient(sender_name, content, recipient_label):
     """Format a message with sender → recipient labeling for context."""
     return f"[{sender_name} → {recipient_label}]: {content}"
+
+
+def get_context_key_and_label(message):
+    """Return a stable storage key + human-readable label for prompts."""
+    if message.guild is None:
+        # DM channel IDs are globally unique.
+        return f"dm:{message.channel.id}", f"DM with {message.author.display_name}"
+
+    guild_id = message.guild.id
+    guild_name = message.guild.name
+    channel_id = message.channel.id
+    channel_name = getattr(message.channel, "name", str(message.channel))
+    return (
+        f"guild:{guild_id}:channel:{channel_id}",
+        f"#{channel_name} in {guild_name}"
+    )
 
 
 # ============================================
@@ -820,7 +850,7 @@ async def on_message(message):
         return
 
     content = message.content.strip()
-    channel_name = str(message.channel)
+    context_key, context_label = get_context_key_and_label(message)
     is_bot_author = message.author.bot
     is_dm = message.guild is None
     is_home = message.guild and str(message.guild.id) == HOME_SERVER_ID
@@ -850,7 +880,7 @@ async def on_message(message):
         elif is_home:
             respond, recipient = should_ben_respond(message, client.user)
             if not respond:
-                save_message(db, channel_name, "user", content, message.author.display_name)
+                save_message(db, context_key, "user", content, message.author.display_name)
                 return
 
         else:
@@ -932,7 +962,7 @@ async def on_message(message):
         cursor = db.cursor()
         cursor.execute(
             "DELETE FROM messages WHERE channel = ?",
-            (channel_name,)
+            (context_key,)
         )
         db.commit()
         await message.channel.send("*History cleared for this channel.*")
@@ -989,12 +1019,12 @@ async def on_message(message):
                 f"Respond naturally as Ben — summarize what's relevant, "
                 f"give your opinion if you have one, and be yourself about it."
             )
-            system_content = build_system_context(db, channel_name)
+            system_content = build_system_context(db, context_key, context_label, is_dm=is_dm)
             msgs = [{"role": "system", "content": system_content}]
-            history = get_recent_messages(db, channel_name)
+            history = get_recent_messages(db, context_key)
             msgs.extend(history)
             msgs.append({"role": "user", "content": search_context})
-            save_message(db, channel_name, "user", f"!search {query}", message.author.display_name)
+            save_message(db, context_key, "user", f"!search {query}", message.author.display_name)
             response_text = await get_ai_response(msgs)
 
             for learn_content in re.findall(r'\[LEARN:\s*(.+?)\]', response_text):
@@ -1003,7 +1033,7 @@ async def on_message(message):
                     add_user_fact(db, username.strip(), fact.strip())
             response_text = re.sub(r'\[LEARN:\s*.+?\]', '', response_text).strip()
 
-            save_message(db, channel_name, "assistant", response_text)
+            save_message(db, context_key, "assistant", response_text)
             if len(response_text) <= 2000:
                 await message.channel.send(response_text)
             else:
@@ -1040,12 +1070,12 @@ async def on_message(message):
                 f"Respond naturally as Ben — summarize what's on the page, "
                 f"note anything interesting, and be yourself about it."
             )
-            system_content = build_system_context(db, channel_name)
+            system_content = build_system_context(db, context_key, context_label, is_dm=is_dm)
             msgs = [{"role": "system", "content": system_content}]
-            history = get_recent_messages(db, channel_name)
+            history = get_recent_messages(db, context_key)
             msgs.extend(history)
             msgs.append({"role": "user", "content": read_context})
-            save_message(db, channel_name, "user", f"!read {url}", message.author.display_name)
+            save_message(db, context_key, "user", f"!read {url}", message.author.display_name)
             response_text = await get_ai_response(msgs)
 
             for learn_content in re.findall(r'\[LEARN:\s*(.+?)\]', response_text):
@@ -1054,7 +1084,7 @@ async def on_message(message):
                     add_user_fact(db, username.strip(), fact.strip())
             response_text = re.sub(r'\[LEARN:\s*.+?\]', '', response_text).strip()
 
-            save_message(db, channel_name, "assistant", response_text)
+            save_message(db, context_key, "assistant", response_text)
             if len(response_text) <= 2000:
                 await message.channel.send(response_text)
             else:
@@ -1077,10 +1107,10 @@ async def on_message(message):
     async with message.channel.typing():
         full_messages = []
 
-        system_content = build_system_context(db, channel_name)
+        system_content = build_system_context(db, context_key, context_label, is_dm=is_dm)
         full_messages.append({"role": "system", "content": system_content})
 
-        history = get_recent_messages(db, channel_name)
+        history = get_recent_messages(db, context_key)
         full_messages.extend(history)
 
         recipient_label = get_message_recipient(message, client.user)
@@ -1108,7 +1138,7 @@ async def on_message(message):
                 })
             full_messages.append({"role": "user", "content": user_content})
             save_message(
-                db, channel_name, "user",
+                db, context_key, "user",
                 f"{content} [image]" if content else "[image]",
                 message.author.display_name
             )
@@ -1118,14 +1148,14 @@ async def on_message(message):
                 "content": labeled_text
             })
             save_message(
-                db, channel_name, "user", content,
+                db, context_key, "user", content,
                 message.author.display_name
             )
 
         response_text = await get_ai_response(full_messages)
-        response_text = await handle_tool_tags(response_text, db, channel_name, full_messages)
+        response_text = await handle_tool_tags(response_text, db, context_key, full_messages)
 
-        save_message(db, channel_name, "assistant", response_text)
+        save_message(db, context_key, "assistant", response_text)
 
         last_responded_message_id = message.id
 
