@@ -690,7 +690,7 @@ async def handle_tool_tags(response_text, db, channel_name, full_messages):
 # ============================================
 # BUILD SYSTEM CONTEXT
 # ============================================
-def build_system_context(db, channel_key, channel_label):
+def build_system_context(db, channel_key, channel_label, is_dm=False):
     """Build the full system prompt with all contextual information."""
     system_content = SYSTEM_PROMPT
 
@@ -724,7 +724,11 @@ def build_system_context(db, channel_key, channel_label):
             for fact in facts:
                 system_content += f"  - {fact}\n"
 
-    other_channels = get_cross_channel_messages(db, channel_key)
+    # In DMs, do not inject cross-channel activity.
+    if not is_dm:
+        other_channels = get_cross_channel_messages(db, channel_key)
+    else:
+        other_channels = {}
     if other_channels:
         system_content += "\n--- ACTIVITY IN OTHER CHANNELS ---\n"
         for ch_name, msgs in other_channels.items():
@@ -741,6 +745,10 @@ def build_system_context(db, channel_key, channel_label):
 # ============================================
 def get_message_recipient(message, bot_user):
     """Determine who a message is directed at. Returns a string label."""
+    if message.guild is None:
+        # In DMs, messages are always directed to Ben.
+        return "@Ben"
+
     if message.mentions:
         names = []
         for user in message.mentions:
@@ -1011,7 +1019,7 @@ async def on_message(message):
                 f"Respond naturally as Ben — summarize what's relevant, "
                 f"give your opinion if you have one, and be yourself about it."
             )
-            system_content = build_system_context(db, context_key, context_label)
+            system_content = build_system_context(db, context_key, context_label, is_dm=is_dm)
             msgs = [{"role": "system", "content": system_content}]
             history = get_recent_messages(db, context_key)
             msgs.extend(history)
@@ -1062,7 +1070,7 @@ async def on_message(message):
                 f"Respond naturally as Ben — summarize what's on the page, "
                 f"note anything interesting, and be yourself about it."
             )
-            system_content = build_system_context(db, context_key, context_label)
+            system_content = build_system_context(db, context_key, context_label, is_dm=is_dm)
             msgs = [{"role": "system", "content": system_content}]
             history = get_recent_messages(db, context_key)
             msgs.extend(history)
@@ -1099,7 +1107,7 @@ async def on_message(message):
     async with message.channel.typing():
         full_messages = []
 
-        system_content = build_system_context(db, context_key, context_label)
+        system_content = build_system_context(db, context_key, context_label, is_dm=is_dm)
         full_messages.append({"role": "system", "content": system_content})
 
         history = get_recent_messages(db, context_key)
