@@ -21,6 +21,7 @@ CONTEXT_WINDOW = 100
 CROSS_CHANNEL_WINDOW = 20  # Recent messages to pull from other channels
 MAX_TOKENS = int(os.getenv("MAX_TOKENS", "2500"))
 DISCORD_RESPONSE_CHAR_LIMIT = int(os.getenv("DISCORD_RESPONSE_CHAR_LIMIT", "1900"))
+DEDUPLICATION_WINDOW_SECONDS = int(os.getenv("DEDUPLICATION_WINDOW_SECONDS", "300"))
 
 # Home server ID — Ben responds to everything here. On other servers, only when addressed.
 HOME_SERVER_ID = os.getenv("HOME_SERVER_ID", "")
@@ -35,8 +36,10 @@ bot_cooldowns = set()
 DAINA_USER_ID = int(os.getenv("DAINA_USER_ID", "0"))
 ALLOW_DAINA_UNADDRESSED_HOME = os.getenv("ALLOW_DAINA_UNADDRESSED_HOME", "false").lower() == "true"
 
-# Deduplication: track last message ID Ben responded to (prevents double-answering)
-last_responded_message_id = None
+# Deduplication: remember messages as soon as Ben starts handling them.
+# This closes the window where Discord/Railway can deliver the same event twice
+# before Ben has finished generating his first answer.
+processing_message_ids = {}
 
 # Timezone offset from UTC (Pacific Time = -7)
 TIMEZONE_OFFSET = -7
@@ -862,6 +865,23 @@ async def send_ai_response(channel, response_text):
     await channel.send(response_text, allowed_mentions=discord.AllowedMentions.none())
 
 
+def claim_message_for_processing(message_id):
+    """Return False if this Discord message is already being/was recently handled."""
+    now = datetime.now()
+    expired_ids = [
+        old_id for old_id, first_seen in processing_message_ids.items()
+        if (now - first_seen).total_seconds() > DEDUPLICATION_WINDOW_SECONDS
+    ]
+    for old_id in expired_ids:
+        processing_message_ids.pop(old_id, None)
+
+    if message_id in processing_message_ids:
+        return False
+
+    processing_message_ids[message_id] = now
+    return True
+
+
 def get_context_key_and_label(message):
     """Return a stable storage key + human-readable label for prompts."""
     if message.guild is None:
@@ -897,12 +917,12 @@ async def on_ready():
 
 @client.event
 async def on_message(message):
-    global CURRENT_MODEL, last_responded_message_id
+    global CURRENT_MODEL
 
     if message.author == client.user:
         return
 
-    if message.id == last_responded_message_id:
+    if not claim_message_for_processing(message.id):
         return
 
     content = message.content.strip()
@@ -1190,13 +1210,10 @@ async def on_message(message):
         response_text = await handle_tool_tags(response_text, db, context_key, full_messages)
         if response_scripts_other_speaker(response_text):
             save_message(db, context_key, "assistant", "[blocked scripted non-Ben response]")
-            last_responded_message_id = message.id
             return
         response_text = fit_response_to_discord(clean_response_text(response_text))
 
         save_message(db, context_key, "assistant", response_text)
-
-        last_responded_message_id = message.id
 
         await send_ai_response(message.channel, response_text)
 
