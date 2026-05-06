@@ -19,7 +19,8 @@ CURRENT_MODEL = "anthropic/claude-opus-4.6"
 
 CONTEXT_WINDOW = 100
 CROSS_CHANNEL_WINDOW = 20  # Recent messages to pull from other channels
-MAX_TOKENS = 4000
+MAX_TOKENS = int(os.getenv("MAX_TOKENS", "2500"))
+DISCORD_RESPONSE_CHAR_LIMIT = int(os.getenv("DISCORD_RESPONSE_CHAR_LIMIT", "1900"))
 
 # Home server ID — Ben responds to everything here. On other servers, only when addressed.
 HOME_SERVER_ID = os.getenv("HOME_SERVER_ID", "")
@@ -32,6 +33,7 @@ bot_cooldowns = set()
 
 # Daina's Discord user ID — used for recipient filtering
 DAINA_USER_ID = int(os.getenv("DAINA_USER_ID", "0"))
+ALLOW_DAINA_UNADDRESSED_HOME = os.getenv("ALLOW_DAINA_UNADDRESSED_HOME", "false").lower() == "true"
 
 # Deduplication: track last message ID Ben responded to (prevents double-answering)
 last_responded_message_id = None
@@ -242,6 +244,12 @@ You should STAY SILENT if:
 Silence is a valid and correct response. Most messages in the group chat are not for you. You do not need to participate in every exchange.
 
 If you're 50/50 on whether a message is for you — assume it isn't.
+
+## OUTPUT SAFETY
+
+Write only Ben's own reply. Never script, simulate, or prefill a message from another human or bot. Do not start a response with labels like "Human:", "Daina:", "Rachael:", "Cassidy:", or any other speaker name unless you are briefly quoting something that already happened.
+
+Never create @everyone or @here pings yourself. If someone else used @everyone, you may talk about it, but do not generate a fresh group ping.
 
 ## IMPORTANT NOTE ABOUT THIS PLATFORM
 
@@ -689,7 +697,7 @@ async def handle_tool_tags(response_text, db, channel_name, full_messages):
 # ============================================
 # BUILD SYSTEM CONTEXT
 # ============================================
-def build_system_context(db, channel_name):
+def build_system_context(db, channel_key, channel_label, is_dm=False):
     """Build the full system prompt with all contextual information."""
     system_content = SYSTEM_PROMPT
 
@@ -700,7 +708,7 @@ def build_system_context(db, channel_name):
     system_content += (
         f"\n\n--- CURRENT MOMENT ---\n"
         f"It is {time_str} on {day_name}, {date_str}.\n"
-        f"You are currently in: #{channel_name}\n"
+        f"You are currently in: {channel_label}\n"
     )
 
     pinned = get_pinned_memories(db)
@@ -723,7 +731,11 @@ def build_system_context(db, channel_name):
             for fact in facts:
                 system_content += f"  - {fact}\n"
 
-    other_channels = get_cross_channel_messages(db, channel_name)
+    # In DMs, do not inject cross-channel activity.
+    if not is_dm:
+        other_channels = get_cross_channel_messages(db, channel_key)
+    else:
+        other_channels = {}
     if other_channels:
         system_content += "\n--- ACTIVITY IN OTHER CHANNELS ---\n"
         for ch_name, msgs in other_channels.items():
@@ -740,6 +752,10 @@ def build_system_context(db, channel_name):
 # ============================================
 def get_message_recipient(message, bot_user):
     """Determine who a message is directed at. Returns a string label."""
+    if message.guild is None:
+        # In DMs, messages are always directed to Ben.
+        return "@Ben"
+
     if message.mentions:
         names = []
         for user in message.mentions:
@@ -778,7 +794,12 @@ def should_ben_respond(message, bot_user):
     if message.mention_everyone:
         return True, recipient
 
-    if DAINA_USER_ID and message.author.id == DAINA_USER_ID and not message.mentions:
+    if (
+        ALLOW_DAINA_UNADDRESSED_HOME
+        and DAINA_USER_ID
+        and message.author.id == DAINA_USER_ID
+        and not message.mentions
+    ):
         return True, recipient
 
     if bool(re.search(r'\bben\b|\bbenji\b|\bbenedic|\bmorgan\b', message.content.lower())):
@@ -790,6 +811,71 @@ def should_ben_respond(message, bot_user):
 def format_message_with_recipient(sender_name, content, recipient_label):
     """Format a message with sender → recipient labeling for context."""
     return f"[{sender_name} → {recipient_label}]: {content}"
+
+
+SCRIPTED_SPEAKER_RE = re.compile(
+    r'^\s*(?:human|user|daina|rachael|rachel|cassidy|cass|hoeda|rafayel|elias|colin|moose|solace)\s*:',
+    re.IGNORECASE
+)
+BEN_PREFIX_RE = re.compile(r'^\s*ben(?:\s+morgan)?\s*:\s*', re.IGNORECASE)
+
+
+def response_scripts_other_speaker(response_text):
+    """Detect when the model starts writing as someone other than Ben."""
+    for line in response_text.splitlines():
+        if not line.strip():
+            continue
+        return bool(SCRIPTED_SPEAKER_RE.match(line))
+    return False
+
+
+def clean_response_text(response_text):
+    """Remove risky model artifacts before sending to Discord."""
+    response_text = response_text.strip()
+    response_text = BEN_PREFIX_RE.sub('', response_text)
+    # Prevent the bot from creating live mass pings, even if the model writes them.
+    response_text = re.sub(
+        r'@(everyone|here)\b',
+        lambda match: '@\u200b' + match.group(1),
+        response_text,
+        flags=re.IGNORECASE
+    )
+    return response_text.strip()
+
+
+def fit_response_to_discord(response_text):
+    """Keep Ben in one Discord message by default so long answers don't look like double replies."""
+    if len(response_text) <= DISCORD_RESPONSE_CHAR_LIMIT:
+        return response_text
+
+    cutoff = response_text[:DISCORD_RESPONSE_CHAR_LIMIT].rfind('\n\n')
+    if cutoff < 800:
+        cutoff = response_text[:DISCORD_RESPONSE_CHAR_LIMIT].rfind('. ')
+    if cutoff < 800:
+        cutoff = DISCORD_RESPONSE_CHAR_LIMIT
+
+    return response_text[:cutoff].rstrip() + "…"
+
+
+async def send_ai_response(channel, response_text):
+    """Send model output safely without allowing @everyone/@here pings."""
+    await channel.send(response_text, allowed_mentions=discord.AllowedMentions.none())
+
+
+def get_context_key_and_label(message):
+    """Return a stable storage key + human-readable label for prompts."""
+    if message.guild is None:
+        # DM channel IDs are globally unique.
+        return f"dm:{message.channel.id}", f"DM with {message.author.display_name}"
+
+    guild_id = message.guild.id
+    guild_name = message.guild.name
+    channel_id = message.channel.id
+    channel_name = getattr(message.channel, "name", str(message.channel))
+    return (
+        f"guild:{guild_id}:channel:{channel_id}",
+        f"#{channel_name} in {guild_name}"
+    )
 
 
 # ============================================
@@ -820,7 +906,7 @@ async def on_message(message):
         return
 
     content = message.content.strip()
-    channel_name = str(message.channel)
+    context_key, context_label = get_context_key_and_label(message)
     is_bot_author = message.author.bot
     is_dm = message.guild is None
     is_home = message.guild and str(message.guild.id) == HOME_SERVER_ID
@@ -850,7 +936,7 @@ async def on_message(message):
         elif is_home:
             respond, recipient = should_ben_respond(message, client.user)
             if not respond:
-                save_message(db, channel_name, "user", content, message.author.display_name)
+                save_message(db, context_key, "user", content, message.author.display_name)
                 return
 
         else:
@@ -932,7 +1018,7 @@ async def on_message(message):
         cursor = db.cursor()
         cursor.execute(
             "DELETE FROM messages WHERE channel = ?",
-            (channel_name,)
+            (context_key,)
         )
         db.commit()
         await message.channel.send("*History cleared for this channel.*")
@@ -989,12 +1075,12 @@ async def on_message(message):
                 f"Respond naturally as Ben — summarize what's relevant, "
                 f"give your opinion if you have one, and be yourself about it."
             )
-            system_content = build_system_context(db, channel_name)
+            system_content = build_system_context(db, context_key, context_label, is_dm=is_dm)
             msgs = [{"role": "system", "content": system_content}]
-            history = get_recent_messages(db, channel_name)
+            history = get_recent_messages(db, context_key)
             msgs.extend(history)
             msgs.append({"role": "user", "content": search_context})
-            save_message(db, channel_name, "user", f"!search {query}", message.author.display_name)
+            save_message(db, context_key, "user", f"!search {query}", message.author.display_name)
             response_text = await get_ai_response(msgs)
 
             for learn_content in re.findall(r'\[LEARN:\s*(.+?)\]', response_text):
@@ -1002,24 +1088,13 @@ async def on_message(message):
                     username, fact = learn_content.split('|', 1)
                     add_user_fact(db, username.strip(), fact.strip())
             response_text = re.sub(r'\[LEARN:\s*.+?\]', '', response_text).strip()
+            if response_scripts_other_speaker(response_text):
+                save_message(db, context_key, "assistant", "[blocked scripted non-Ben response]")
+                return
+            response_text = fit_response_to_discord(clean_response_text(response_text))
 
-            save_message(db, channel_name, "assistant", response_text)
-            if len(response_text) <= 2000:
-                await message.channel.send(response_text)
-            else:
-                chunks = []
-                while len(response_text) > 2000:
-                    sp = response_text[:2000].rfind('\n')
-                    if sp == -1:
-                        sp = response_text[:2000].rfind(' ')
-                    if sp == -1:
-                        sp = 2000
-                    chunks.append(response_text[:sp])
-                    response_text = response_text[sp:].lstrip()
-                if response_text:
-                    chunks.append(response_text)
-                for chunk in chunks:
-                    await message.channel.send(chunk)
+            save_message(db, context_key, "assistant", response_text)
+            await send_ai_response(message.channel, response_text)
         return
 
     if content.startswith("!read"):
@@ -1040,12 +1115,12 @@ async def on_message(message):
                 f"Respond naturally as Ben — summarize what's on the page, "
                 f"note anything interesting, and be yourself about it."
             )
-            system_content = build_system_context(db, channel_name)
+            system_content = build_system_context(db, context_key, context_label, is_dm=is_dm)
             msgs = [{"role": "system", "content": system_content}]
-            history = get_recent_messages(db, channel_name)
+            history = get_recent_messages(db, context_key)
             msgs.extend(history)
             msgs.append({"role": "user", "content": read_context})
-            save_message(db, channel_name, "user", f"!read {url}", message.author.display_name)
+            save_message(db, context_key, "user", f"!read {url}", message.author.display_name)
             response_text = await get_ai_response(msgs)
 
             for learn_content in re.findall(r'\[LEARN:\s*(.+?)\]', response_text):
@@ -1053,34 +1128,23 @@ async def on_message(message):
                     username, fact = learn_content.split('|', 1)
                     add_user_fact(db, username.strip(), fact.strip())
             response_text = re.sub(r'\[LEARN:\s*.+?\]', '', response_text).strip()
+            if response_scripts_other_speaker(response_text):
+                save_message(db, context_key, "assistant", "[blocked scripted non-Ben response]")
+                return
+            response_text = fit_response_to_discord(clean_response_text(response_text))
 
-            save_message(db, channel_name, "assistant", response_text)
-            if len(response_text) <= 2000:
-                await message.channel.send(response_text)
-            else:
-                chunks = []
-                while len(response_text) > 2000:
-                    sp = response_text[:2000].rfind('\n')
-                    if sp == -1:
-                        sp = response_text[:2000].rfind(' ')
-                    if sp == -1:
-                        sp = 2000
-                    chunks.append(response_text[:sp])
-                    response_text = response_text[sp:].lstrip()
-                if response_text:
-                    chunks.append(response_text)
-                for chunk in chunks:
-                    await message.channel.send(chunk)
+            save_message(db, context_key, "assistant", response_text)
+            await send_ai_response(message.channel, response_text)
         return
 
     # --- CONVERSATION ---
     async with message.channel.typing():
         full_messages = []
 
-        system_content = build_system_context(db, channel_name)
+        system_content = build_system_context(db, context_key, context_label, is_dm=is_dm)
         full_messages.append({"role": "system", "content": system_content})
 
-        history = get_recent_messages(db, channel_name)
+        history = get_recent_messages(db, context_key)
         full_messages.extend(history)
 
         recipient_label = get_message_recipient(message, client.user)
@@ -1108,7 +1172,7 @@ async def on_message(message):
                 })
             full_messages.append({"role": "user", "content": user_content})
             save_message(
-                db, channel_name, "user",
+                db, context_key, "user",
                 f"{content} [image]" if content else "[image]",
                 message.author.display_name
             )
@@ -1118,33 +1182,23 @@ async def on_message(message):
                 "content": labeled_text
             })
             save_message(
-                db, channel_name, "user", content,
+                db, context_key, "user", content,
                 message.author.display_name
             )
 
         response_text = await get_ai_response(full_messages)
-        response_text = await handle_tool_tags(response_text, db, channel_name, full_messages)
+        response_text = await handle_tool_tags(response_text, db, context_key, full_messages)
+        if response_scripts_other_speaker(response_text):
+            save_message(db, context_key, "assistant", "[blocked scripted non-Ben response]")
+            last_responded_message_id = message.id
+            return
+        response_text = fit_response_to_discord(clean_response_text(response_text))
 
-        save_message(db, channel_name, "assistant", response_text)
+        save_message(db, context_key, "assistant", response_text)
 
         last_responded_message_id = message.id
 
-        if len(response_text) <= 2000:
-            await message.channel.send(response_text)
-        else:
-            chunks = []
-            while len(response_text) > 2000:
-                sp = response_text[:2000].rfind('\n')
-                if sp == -1:
-                    sp = response_text[:2000].rfind(' ')
-                if sp == -1:
-                    sp = 2000
-                chunks.append(response_text[:sp])
-                response_text = response_text[sp:].lstrip()
-            if response_text:
-                chunks.append(response_text)
-            for chunk in chunks:
-                await message.channel.send(chunk)
+        await send_ai_response(message.channel, response_text)
 
 
 # ============================================
