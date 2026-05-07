@@ -2,6 +2,7 @@ import discord
 import aiohttp
 import sqlite3
 import json
+import hashlib
 import os
 import re
 import asyncio
@@ -22,6 +23,7 @@ CROSS_CHANNEL_WINDOW = 20  # Recent messages to pull from other channels
 MAX_TOKENS = int(os.getenv("MAX_TOKENS", "2500"))
 DISCORD_RESPONSE_CHAR_LIMIT = int(os.getenv("DISCORD_RESPONSE_CHAR_LIMIT", "1900"))
 DEDUPLICATION_WINDOW_SECONDS = int(os.getenv("DEDUPLICATION_WINDOW_SECONDS", "300"))
+DUPLICATE_CONTENT_WINDOW_SECONDS = int(os.getenv("DUPLICATE_CONTENT_WINDOW_SECONDS", "20"))
 
 # Home server ID — Ben responds to everything here. On other servers, only when addressed.
 HOME_SERVER_ID = os.getenv("HOME_SERVER_ID", "")
@@ -39,7 +41,7 @@ ALLOW_DAINA_UNADDRESSED_HOME = os.getenv("ALLOW_DAINA_UNADDRESSED_HOME", "false"
 # Deduplication: remember messages as soon as Ben starts handling them.
 # This closes the window where Discord/Railway can deliver the same event twice
 # before Ben has finished generating his first answer.
-processing_message_ids = {}
+# Stored in SQLite so overlapping bot processes share the same "already handling this" list.
 
 # Timezone offset from UTC (Pacific Time = -7)
 TIMEZONE_OFFSET = -7
@@ -334,6 +336,13 @@ def init_database():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             username TEXT NOT NULL,
             fact TEXT NOT NULL,
+            timestamp TEXT NOT NULL
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS message_claims (
+            claim_key TEXT PRIMARY KEY,
+            claim_type TEXT NOT NULL,
             timestamp TEXT NOT NULL
         )
     """)
@@ -865,20 +874,51 @@ async def send_ai_response(channel, response_text):
     await channel.send(response_text, allowed_mentions=discord.AllowedMentions.none())
 
 
-def claim_message_for_processing(message_id):
+def get_message_signature(message, context_key, content):
+    """Build a short fingerprint for duplicate events with different Discord IDs."""
+    attachment_ids = [str(getattr(attachment, "id", attachment.url)) for attachment in message.attachments]
+    reference_id = ""
+    if message.reference:
+        reference_id = str(getattr(message.reference, "message_id", ""))
+    normalized_content = re.sub(r'\s+', ' ', content).strip().lower()
+    payload = json.dumps({
+        "author_id": str(message.author.id),
+        "attachments": attachment_ids,
+        "content": normalized_content,
+        "context_key": context_key,
+        "reference_id": reference_id,
+    }, sort_keys=True)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def claim_message_for_processing(db, message, context_key, content):
     """Return False if this Discord message is already being/was recently handled."""
     now = datetime.now()
-    expired_ids = [
-        old_id for old_id, first_seen in processing_message_ids.items()
-        if (now - first_seen).total_seconds() > DEDUPLICATION_WINDOW_SECONDS
+    cursor = db.cursor()
+    cursor.execute(
+        "DELETE FROM message_claims WHERE claim_type = ? AND timestamp < ?",
+        ("message_id", (now - timedelta(seconds=DEDUPLICATION_WINDOW_SECONDS)).isoformat())
+    )
+    cursor.execute(
+        "DELETE FROM message_claims WHERE claim_type = ? AND timestamp < ?",
+        ("signature", (now - timedelta(seconds=DUPLICATE_CONTENT_WINDOW_SECONDS)).isoformat())
+    )
+
+    claims = [
+        (f"message:{message.id}", "message_id"),
+        (f"signature:{get_message_signature(message, context_key, content)}", "signature"),
     ]
-    for old_id in expired_ids:
-        processing_message_ids.pop(old_id, None)
 
-    if message_id in processing_message_ids:
-        return False
+    for claim_key, claim_type in claims:
+        cursor.execute(
+            "INSERT OR IGNORE INTO message_claims (claim_key, claim_type, timestamp) VALUES (?, ?, ?)",
+            (claim_key, claim_type, now.isoformat())
+        )
+        if cursor.rowcount == 0:
+            db.commit()
+            return False
 
-    processing_message_ids[message_id] = now
+    db.commit()
     return True
 
 
@@ -922,11 +962,11 @@ async def on_message(message):
     if message.author == client.user:
         return
 
-    if not claim_message_for_processing(message.id):
-        return
-
     content = message.content.strip()
     context_key, context_label = get_context_key_and_label(message)
+    if not claim_message_for_processing(db, message, context_key, content):
+        return
+
     is_bot_author = message.author.bot
     is_dm = message.guild is None
     is_home = message.guild and str(message.guild.id) == HOME_SERVER_ID
