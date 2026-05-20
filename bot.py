@@ -24,6 +24,7 @@ MAX_TOKENS = int(os.getenv("MAX_TOKENS", "2500"))
 DISCORD_RESPONSE_CHAR_LIMIT = int(os.getenv("DISCORD_RESPONSE_CHAR_LIMIT", "1900"))
 DEDUPLICATION_WINDOW_SECONDS = int(os.getenv("DEDUPLICATION_WINDOW_SECONDS", "300"))
 DUPLICATE_CONTENT_WINDOW_SECONDS = int(os.getenv("DUPLICATE_CONTENT_WINDOW_SECONDS", "20"))
+DEDUPE_LOGGING_ENABLED = os.getenv("DEDUPE_LOGGING_ENABLED", "true").lower() == "true"
 
 # Home server ID — Ben responds to everything here. On other servers, only when addressed.
 HOME_SERVER_ID = os.getenv("HOME_SERVER_ID", "")
@@ -875,6 +876,16 @@ async def send_ai_response(channel, response_text):
     await channel.send(response_text, allowed_mentions=discord.AllowedMentions.none())
 
 
+
+
+def dedupe_log(event, **fields):
+    """Lightweight structured logging for duplicate-response debugging."""
+    if not DEDUPE_LOGGING_ENABLED:
+        return
+    details = " ".join(f"{key}={value}" for key, value in fields.items() if value is not None)
+    print(f"[dedupe] {event}" + (f" {details}" if details else ""))
+
+
 def get_message_signature(message, context_key, content):
     """Build a short fingerprint for duplicate events with different Discord IDs."""
     attachment_ids = [str(getattr(attachment, "id", attachment.url)) for attachment in message.attachments]
@@ -916,9 +927,23 @@ def claim_message_for_processing(db, message, context_key, content):
             (claim_key, claim_type, now.isoformat())
         )
         if cursor.rowcount == 0:
+            dedupe_log(
+                "skip_duplicate",
+                claim_type=claim_type,
+                claim_key=claim_key,
+                discord_message_id=message.id,
+                author_id=message.author.id,
+                channel=context_key,
+            )
             db.commit()
             return False
 
+    dedupe_log(
+        "claim_acquired",
+        discord_message_id=message.id,
+        author_id=message.author.id,
+        channel=context_key,
+    )
     db.commit()
     return True
 
@@ -975,20 +1000,26 @@ async def on_message(message):
     # --- BOT-TO-BOT LOGIC (external servers only) ---
     if is_bot_author:
         if is_dm or is_home:
+            dedupe_log("skip_bot_message", reason="bot_message_in_dm_or_home", discord_message_id=message.id, author_id=message.author.id)
             return
 
         is_named_by_bot = bool(re.search(r'\bben\b|\bbenji\b|\bbenedic|\bmorgan\b', content.lower()))
         if not is_named_by_bot:
+            dedupe_log("skip_bot_message", reason="bot_not_addressing_ben", discord_message_id=message.id, author_id=message.author.id)
             return
 
         bot_id = message.author.id
         if bot_id in bot_cooldowns:
+            dedupe_log("skip_bot_message", reason="bot_cooldown_active", discord_message_id=message.id, author_id=bot_id)
             return
 
         bot_cooldowns.add(bot_id)
+        dedupe_log("bot_cooldown_set", discord_message_id=message.id, author_id=bot_id)
 
     else:
         # --- HUMAN MESSAGE ---
+        if bot_cooldowns:
+            dedupe_log("bot_cooldown_cleared", reason="human_message_received", discord_message_id=message.id, author_id=message.author.id)
         bot_cooldowns.clear()
 
         if is_dm:
