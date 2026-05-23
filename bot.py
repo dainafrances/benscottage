@@ -24,6 +24,7 @@ MAX_TOKENS = int(os.getenv("MAX_TOKENS", "2500"))
 DISCORD_RESPONSE_CHAR_LIMIT = int(os.getenv("DISCORD_RESPONSE_CHAR_LIMIT", "1900"))
 DEDUPLICATION_WINDOW_SECONDS = int(os.getenv("DEDUPLICATION_WINDOW_SECONDS", "300"))
 DUPLICATE_CONTENT_WINDOW_SECONDS = int(os.getenv("DUPLICATE_CONTENT_WINDOW_SECONDS", "20"))
+BOT_REPLY_COOLDOWN_SECONDS = int(os.getenv("BOT_REPLY_COOLDOWN_SECONDS", "12"))
 DEDUPE_LOGGING_ENABLED = os.getenv("DEDUPE_LOGGING_ENABLED", "true").lower() == "true"
 
 # Home server ID — Ben responds to everything here. On other servers, only when addressed.
@@ -34,6 +35,7 @@ COMPANION_NAMES = ["rafayel", "elias", "colin", "moose", "solace"]
 
 # Track which bots Ben has already responded to (reset when a human speaks)
 bot_cooldowns = set()
+bot_reply_cooldowns = {}  # channel_id -> datetime of last bot-origin reply
 
 # Daina's Discord user ID — used for recipient filtering
 DAINA_USER_ID = int(os.getenv("DAINA_USER_ID", "0"))
@@ -861,8 +863,9 @@ def fit_response_to_discord(response_text):
     return response_text[:cutoff].rstrip() + "…"
 
 
-async def send_ai_response(channel, response_text):
+async def send_ai_response(channel, response_text, source="human", trigger_message_id=None):
     """Send model output safely without allowing @everyone/@here pings."""
+    dedupe_log("sending_response", source=source, discord_message_id=trigger_message_id, channel_id=getattr(channel, "id", None))
     await channel.send(response_text, allowed_mentions=discord.AllowedMentions.none())
 
 
@@ -986,6 +989,7 @@ async def on_message(message):
     is_bot_author = message.author.bot
     is_dm = message.guild is None
     is_home = message.guild and str(message.guild.id) == HOME_SERVER_ID
+    source = "companion-bot" if is_bot_author else "human"
 
     # --- BOT-TO-BOT LOGIC (external servers only) ---
     if is_bot_author:
@@ -993,10 +997,20 @@ async def on_message(message):
             dedupe_log("skip_bot_message", reason="bot_message_in_dm_or_home", discord_message_id=message.id, author_id=message.author.id)
             return
 
-        is_named_by_bot = bool(re.search(r'\bben\b|\bbenji\b|\bbenedic|\bmorgan\b', content.lower()))
-        if not is_named_by_bot:
-            dedupe_log("skip_bot_message", reason="bot_not_addressing_ben", discord_message_id=message.id, author_id=message.author.id)
+        is_mentioned_by_bot = client.user in message.mentions
+        if not is_mentioned_by_bot:
+            dedupe_log("skip_bot_message", reason="bot_missing_direct_mention", discord_message_id=message.id, author_id=message.author.id)
             return
+
+        channel_id = message.channel.id
+        now = datetime.now()
+        last_reply_at = bot_reply_cooldowns.get(channel_id)
+        if last_reply_at is not None:
+            elapsed = (now - last_reply_at).total_seconds()
+            if elapsed < BOT_REPLY_COOLDOWN_SECONDS:
+                remaining = round(BOT_REPLY_COOLDOWN_SECONDS - elapsed, 2)
+                dedupe_log("skip_bot_trigger_cooldown", source=source, channel_id=channel_id, discord_message_id=message.id, remaining_seconds=remaining)
+                return
 
         bot_id = message.author.id
         if bot_id in bot_cooldowns:
@@ -1004,7 +1018,7 @@ async def on_message(message):
             return
 
         bot_cooldowns.add(bot_id)
-        dedupe_log("bot_cooldown_set", discord_message_id=message.id, author_id=bot_id)
+        dedupe_log("bot_trigger_accepted", source=source, channel_id=channel_id, discord_message_id=message.id, author_id=bot_id)
 
     else:
         # --- HUMAN MESSAGE ---
@@ -1176,7 +1190,10 @@ async def on_message(message):
             response_text = fit_response_to_discord(clean_response_text(response_text))
 
             save_message(db, context_key, "assistant", response_text)
-            await send_ai_response(message.channel, response_text)
+            await send_ai_response(message.channel, response_text, source=source, trigger_message_id=message.id)
+            if source == "companion-bot":
+                bot_reply_cooldowns[message.channel.id] = datetime.now()
+                dedupe_log("bot_reply_cooldown_set", source=source, channel_id=message.channel.id, discord_message_id=message.id, cooldown_seconds=BOT_REPLY_COOLDOWN_SECONDS)
         return
 
     if content.startswith("!read"):
@@ -1216,7 +1233,10 @@ async def on_message(message):
             response_text = fit_response_to_discord(clean_response_text(response_text))
 
             save_message(db, context_key, "assistant", response_text)
-            await send_ai_response(message.channel, response_text)
+            await send_ai_response(message.channel, response_text, source=source, trigger_message_id=message.id)
+            if source == "companion-bot":
+                bot_reply_cooldowns[message.channel.id] = datetime.now()
+                dedupe_log("bot_reply_cooldown_set", source=source, channel_id=message.channel.id, discord_message_id=message.id, cooldown_seconds=BOT_REPLY_COOLDOWN_SECONDS)
         return
 
     # --- CONVERSATION ---
@@ -1277,7 +1297,10 @@ async def on_message(message):
 
         save_message(db, context_key, "assistant", response_text)
 
-        await send_ai_response(message.channel, response_text)
+        await send_ai_response(message.channel, response_text, source=source, trigger_message_id=message.id)
+        if source == "companion-bot":
+            bot_reply_cooldowns[message.channel.id] = datetime.now()
+            dedupe_log("bot_reply_cooldown_set", source=source, channel_id=message.channel.id, discord_message_id=message.id, cooldown_seconds=BOT_REPLY_COOLDOWN_SECONDS)
 
 
 # ============================================
