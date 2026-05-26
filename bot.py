@@ -703,7 +703,7 @@ async def handle_tool_tags(response_text, db, channel_name, full_messages):
 # ============================================
 # BUILD SYSTEM CONTEXT
 # ============================================
-def build_system_context(db, channel_key, channel_label, is_dm=False):
+def build_system_context(db, channel_key, channel_label, is_dm=False, force_public_reply=False, force_public_reply_reason=None):
     """Build the full system prompt with all contextual information."""
     system_content = SYSTEM_PROMPT
 
@@ -749,6 +749,16 @@ def build_system_context(db, channel_key, channel_label, is_dm=False):
             for msg in msgs[-5:]:
                 system_content += f"{msg}\n"
             system_content += "\n"
+
+
+    if force_public_reply:
+        system_content += (
+            "\n--- RUNTIME RESPONSE OVERRIDE ---\n"
+            "The code-level router already decided this message is for Ben. "
+            "Do NOT say you should stay silent or abstain. "
+            "Reply naturally as Ben to the latest message. "
+            f"Trigger reason: {force_public_reply_reason or 'addressed to Ben'}.\n"
+        )
 
     return system_content
 
@@ -990,6 +1000,8 @@ async def on_message(message):
     is_dm = message.guild is None
     is_home = message.guild and str(message.guild.id) == HOME_SERVER_ID
     source = "companion-bot" if is_bot_author else "human"
+    force_public_reply = False
+    force_public_reply_reason = None
 
     # --- BOT-TO-BOT LOGIC (external servers only) ---
     if is_bot_author:
@@ -1019,6 +1031,8 @@ async def on_message(message):
 
         bot_cooldowns.add(bot_id)
         dedupe_log("bot_trigger_accepted", source=source, channel_id=channel_id, discord_message_id=message.id, author_id=bot_id)
+        force_public_reply = True
+        force_public_reply_reason = "bot_direct_mention"
 
     else:
         # --- HUMAN MESSAGE ---
@@ -1031,6 +1045,13 @@ async def on_message(message):
 
         elif is_home:
             respond, recipient = should_ben_respond(message, client.user)
+            if respond:
+                if client.user in message.mentions:
+                    force_public_reply = True
+                    force_public_reply_reason = "direct_mention"
+                elif bool(getattr(message, "mention_everyone", False)):
+                    force_public_reply = True
+                    force_public_reply_reason = "mention_everyone"
             if not respond:
                 save_message(db, context_key, "user", content, message.author.display_name)
                 return
@@ -1048,6 +1069,12 @@ async def on_message(message):
 
             if not (is_mentioned or is_everyone or is_named or is_reply_to_ben):
                 return
+            if is_mentioned:
+                force_public_reply = True
+                force_public_reply_reason = "direct_mention"
+            elif is_everyone:
+                force_public_reply = True
+                force_public_reply_reason = "mention_everyone"
 
     # --- COMMANDS ---
     if content.startswith("!model"):
@@ -1171,7 +1198,7 @@ async def on_message(message):
                 f"Respond naturally as Ben — summarize what's relevant, "
                 f"give your opinion if you have one, and be yourself about it."
             )
-            system_content = build_system_context(db, context_key, context_label, is_dm=is_dm)
+            system_content = build_system_context(db, context_key, context_label, is_dm=is_dm, force_public_reply=force_public_reply, force_public_reply_reason=force_public_reply_reason)
             msgs = [{"role": "system", "content": system_content}]
             history = get_recent_messages(db, context_key)
             msgs.extend(history)
@@ -1214,7 +1241,7 @@ async def on_message(message):
                 f"Respond naturally as Ben — summarize what's on the page, "
                 f"note anything interesting, and be yourself about it."
             )
-            system_content = build_system_context(db, context_key, context_label, is_dm=is_dm)
+            system_content = build_system_context(db, context_key, context_label, is_dm=is_dm, force_public_reply=force_public_reply, force_public_reply_reason=force_public_reply_reason)
             msgs = [{"role": "system", "content": system_content}]
             history = get_recent_messages(db, context_key)
             msgs.extend(history)
@@ -1243,7 +1270,7 @@ async def on_message(message):
     async with message.channel.typing():
         full_messages = []
 
-        system_content = build_system_context(db, context_key, context_label, is_dm=is_dm)
+        system_content = build_system_context(db, context_key, context_label, is_dm=is_dm, force_public_reply=force_public_reply, force_public_reply_reason=force_public_reply_reason)
         full_messages.append({"role": "system", "content": system_content})
 
         history = get_recent_messages(db, context_key)
