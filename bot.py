@@ -21,9 +21,11 @@ CURRENT_MODEL = "anthropic/claude-opus-4.6"
 CONTEXT_WINDOW = 100
 CROSS_CHANNEL_WINDOW = 20  # Recent messages to pull from other channels
 MAX_TOKENS = int(os.getenv("MAX_TOKENS", "2500"))
-DISCORD_RESPONSE_CHAR_LIMIT = int(os.getenv("DISCORD_RESPONSE_CHAR_LIMIT", "1900"))
+DISCORD_RESPONSE_CHAR_LIMIT = int(os.getenv("DISCORD_RESPONSE_CHAR_LIMIT", "2000"))
 DEDUPLICATION_WINDOW_SECONDS = int(os.getenv("DEDUPLICATION_WINDOW_SECONDS", "300"))
 DUPLICATE_CONTENT_WINDOW_SECONDS = int(os.getenv("DUPLICATE_CONTENT_WINDOW_SECONDS", "20"))
+BOT_REPLY_COOLDOWN_SECONDS = int(os.getenv("BOT_REPLY_COOLDOWN_SECONDS", "12"))
+DEDUPE_LOGGING_ENABLED = os.getenv("DEDUPE_LOGGING_ENABLED", "true").lower() == "true"
 
 # Home server ID — Ben responds to everything here. On other servers, only when addressed.
 HOME_SERVER_ID = os.getenv("HOME_SERVER_ID", "")
@@ -33,6 +35,7 @@ COMPANION_NAMES = ["rafayel", "elias", "colin", "moose", "solace"]
 
 # Track which bots Ben has already responded to (reset when a human speaks)
 bot_cooldowns = set()
+bot_reply_cooldowns = {}  # channel_id -> datetime of last bot-origin reply
 
 # Daina's Discord user ID — used for recipient filtering
 DAINA_USER_ID = int(os.getenv("DAINA_USER_ID", "0"))
@@ -710,7 +713,7 @@ async def handle_tool_tags(response_text, db, channel_name, full_messages):
 # ============================================
 # BUILD SYSTEM CONTEXT
 # ============================================
-def build_system_context(db, channel_key, channel_label, is_dm=False):
+def build_system_context(db, channel_key, channel_label, is_dm=False, force_public_reply=False, force_public_reply_reason=None):
     """Build the full system prompt with all contextual information."""
     system_content = SYSTEM_PROMPT
 
@@ -756,6 +759,16 @@ def build_system_context(db, channel_key, channel_label, is_dm=False):
             for msg in msgs[-5:]:
                 system_content += f"{msg}\n"
             system_content += "\n"
+
+
+    if force_public_reply:
+        system_content += (
+            "\n--- RUNTIME RESPONSE OVERRIDE ---\n"
+            "The code-level router already decided this message is for Ben. "
+            "Do NOT say you should stay silent or abstain. "
+            "Reply naturally as Ben to the latest message. "
+            f"Trigger reason: {force_public_reply_reason or 'addressed to Ben'}.\n"
+        )
 
     return system_content
 
@@ -856,23 +869,70 @@ def clean_response_text(response_text):
     return response_text.strip()
 
 
-def fit_response_to_discord(response_text):
-    """Keep Ben in one Discord message by default so long answers don't look like double replies."""
-    if len(response_text) <= DISCORD_RESPONSE_CHAR_LIMIT:
-        return response_text
+def split_response_for_discord(response_text, chunk_size=1800):
+    """Split long responses into ordered Discord-safe chunks without losing content."""
+    if len(response_text) <= chunk_size:
+        return [response_text]
 
-    cutoff = response_text[:DISCORD_RESPONSE_CHAR_LIMIT].rfind('\n\n')
-    if cutoff < 800:
-        cutoff = response_text[:DISCORD_RESPONSE_CHAR_LIMIT].rfind('. ')
-    if cutoff < 800:
-        cutoff = DISCORD_RESPONSE_CHAR_LIMIT
+    chunks = []
+    remaining = response_text
 
-    return response_text[:cutoff].rstrip() + "…"
+    while len(remaining) > chunk_size:
+        window = remaining[:chunk_size]
+        split_at = window.rfind('\n\n')
+        if split_at < 600:
+            split_at = window.rfind('\n')
+        if split_at < 600:
+            split_at = window.rfind('. ')
+            if split_at >= 600:
+                split_at += 1
+        if split_at < 600:
+            split_at = chunk_size
+
+        chunk = remaining[:split_at].rstrip()
+        if not chunk:
+            chunk = remaining[:chunk_size]
+            split_at = chunk_size
+
+        chunks.append(chunk)
+        remaining = remaining[split_at:].lstrip()
+
+    if remaining:
+        chunks.append(remaining)
+
+    return chunks
 
 
-async def send_ai_response(channel, response_text):
+async def send_ai_response(channel, response_text, source="human", trigger_message_id=None):
     """Send model output safely without allowing @everyone/@here pings."""
-    await channel.send(response_text, allowed_mentions=discord.AllowedMentions.none())
+    chunks = split_response_for_discord(response_text)
+    dedupe_log(
+        "sending_response",
+        source=source,
+        discord_message_id=trigger_message_id,
+        channel_id=getattr(channel, "id", None),
+        chunk_count=len(chunks),
+    )
+    for index, chunk in enumerate(chunks, start=1):
+        dedupe_log(
+            "sending_response_chunk",
+            source=source,
+            discord_message_id=trigger_message_id,
+            channel_id=getattr(channel, "id", None),
+            chunk_index=index,
+            chunk_length=len(chunk),
+        )
+        await channel.send(chunk, allowed_mentions=discord.AllowedMentions.none())
+
+
+
+
+def dedupe_log(event, **fields):
+    """Lightweight structured logging for duplicate-response debugging."""
+    if not DEDUPE_LOGGING_ENABLED:
+        return
+    details = " ".join(f"{key}={value}" for key, value in fields.items() if value is not None)
+    print(f"[dedupe] {event}" + (f" {details}" if details else ""))
 
 
 def get_message_signature(message, context_key, content):
@@ -916,9 +976,23 @@ def claim_message_for_processing(db, message, context_key, content):
             (claim_key, claim_type, now.isoformat())
         )
         if cursor.rowcount == 0:
+            dedupe_log(
+                "skip_duplicate",
+                claim_type=claim_type,
+                claim_key=claim_key,
+                discord_message_id=message.id,
+                author_id=message.author.id,
+                channel=context_key,
+            )
             db.commit()
             return False
 
+    dedupe_log(
+        "claim_acquired",
+        discord_message_id=message.id,
+        author_id=message.author.id,
+        channel=context_key,
+    )
     db.commit()
     return True
 
@@ -971,24 +1045,45 @@ async def on_message(message):
     is_bot_author = message.author.bot
     is_dm = message.guild is None
     is_home = message.guild and str(message.guild.id) == HOME_SERVER_ID
+    source = "companion-bot" if is_bot_author else "human"
+    force_public_reply = False
+    force_public_reply_reason = None
 
     # --- BOT-TO-BOT LOGIC (external servers only) ---
     if is_bot_author:
         if is_dm or is_home:
+            dedupe_log("skip_bot_message", reason="bot_message_in_dm_or_home", discord_message_id=message.id, author_id=message.author.id)
             return
 
-        is_named_by_bot = bool(re.search(r'\bben\b|\bbenji\b|\bbenedic|\bmorgan\b', content.lower()))
-        if not is_named_by_bot:
+        is_mentioned_by_bot = client.user in message.mentions
+        if not is_mentioned_by_bot:
+            dedupe_log("skip_bot_message", reason="bot_missing_direct_mention", discord_message_id=message.id, author_id=message.author.id)
             return
+
+        channel_id = message.channel.id
+        now = datetime.now()
+        last_reply_at = bot_reply_cooldowns.get(channel_id)
+        if last_reply_at is not None:
+            elapsed = (now - last_reply_at).total_seconds()
+            if elapsed < BOT_REPLY_COOLDOWN_SECONDS:
+                remaining = round(BOT_REPLY_COOLDOWN_SECONDS - elapsed, 2)
+                dedupe_log("skip_bot_trigger_cooldown", source=source, channel_id=channel_id, discord_message_id=message.id, remaining_seconds=remaining)
+                return
 
         bot_id = message.author.id
         if bot_id in bot_cooldowns:
+            dedupe_log("skip_bot_message", reason="bot_cooldown_active", discord_message_id=message.id, author_id=bot_id)
             return
 
         bot_cooldowns.add(bot_id)
+        dedupe_log("bot_trigger_accepted", source=source, channel_id=channel_id, discord_message_id=message.id, author_id=bot_id)
+        force_public_reply = True
+        force_public_reply_reason = "bot_direct_mention"
 
     else:
         # --- HUMAN MESSAGE ---
+        if bot_cooldowns:
+            dedupe_log("bot_cooldown_cleared", reason="human_message_received", discord_message_id=message.id, author_id=message.author.id)
         bot_cooldowns.clear()
 
         if is_dm:
@@ -996,6 +1091,13 @@ async def on_message(message):
 
         elif is_home:
             respond, recipient = should_ben_respond(message, client.user)
+            if respond:
+                if client.user in message.mentions:
+                    force_public_reply = True
+                    force_public_reply_reason = "direct_mention"
+                elif bool(getattr(message, "mention_everyone", False)):
+                    force_public_reply = True
+                    force_public_reply_reason = "mention_everyone"
             if not respond:
                 save_message(db, context_key, "user", content, message.author.display_name)
                 return
@@ -1013,6 +1115,12 @@ async def on_message(message):
 
             if not (is_mentioned or is_everyone or is_named or is_reply_to_ben):
                 return
+            if is_mentioned:
+                force_public_reply = True
+                force_public_reply_reason = "direct_mention"
+            elif is_everyone:
+                force_public_reply = True
+                force_public_reply_reason = "mention_everyone"
 
     # --- COMMANDS ---
     if content.startswith("!model"):
@@ -1136,7 +1244,7 @@ async def on_message(message):
                 f"Respond naturally as Ben — summarize what's relevant, "
                 f"give your opinion if you have one, and be yourself about it."
             )
-            system_content = build_system_context(db, context_key, context_label, is_dm=is_dm)
+            system_content = build_system_context(db, context_key, context_label, is_dm=is_dm, force_public_reply=force_public_reply, force_public_reply_reason=force_public_reply_reason)
             msgs = [{"role": "system", "content": system_content}]
             history = get_recent_messages(db, context_key)
             msgs.extend(history)
@@ -1152,10 +1260,13 @@ async def on_message(message):
             if response_scripts_other_speaker(response_text):
                 save_message(db, context_key, "assistant", "[blocked scripted non-Ben response]")
                 return
-            response_text = fit_response_to_discord(clean_response_text(response_text))
+            response_text = clean_response_text(response_text)
 
             save_message(db, context_key, "assistant", response_text)
-            await send_ai_response(message.channel, response_text)
+            await send_ai_response(message.channel, response_text, source=source, trigger_message_id=message.id)
+            if source == "companion-bot":
+                bot_reply_cooldowns[message.channel.id] = datetime.now()
+                dedupe_log("bot_reply_cooldown_set", source=source, channel_id=message.channel.id, discord_message_id=message.id, cooldown_seconds=BOT_REPLY_COOLDOWN_SECONDS)
         return
 
     if content.startswith("!read"):
@@ -1176,7 +1287,7 @@ async def on_message(message):
                 f"Respond naturally as Ben — summarize what's on the page, "
                 f"note anything interesting, and be yourself about it."
             )
-            system_content = build_system_context(db, context_key, context_label, is_dm=is_dm)
+            system_content = build_system_context(db, context_key, context_label, is_dm=is_dm, force_public_reply=force_public_reply, force_public_reply_reason=force_public_reply_reason)
             msgs = [{"role": "system", "content": system_content}]
             history = get_recent_messages(db, context_key)
             msgs.extend(history)
@@ -1192,17 +1303,20 @@ async def on_message(message):
             if response_scripts_other_speaker(response_text):
                 save_message(db, context_key, "assistant", "[blocked scripted non-Ben response]")
                 return
-            response_text = fit_response_to_discord(clean_response_text(response_text))
+            response_text = clean_response_text(response_text)
 
             save_message(db, context_key, "assistant", response_text)
-            await send_ai_response(message.channel, response_text)
+            await send_ai_response(message.channel, response_text, source=source, trigger_message_id=message.id)
+            if source == "companion-bot":
+                bot_reply_cooldowns[message.channel.id] = datetime.now()
+                dedupe_log("bot_reply_cooldown_set", source=source, channel_id=message.channel.id, discord_message_id=message.id, cooldown_seconds=BOT_REPLY_COOLDOWN_SECONDS)
         return
 
     # --- CONVERSATION ---
     async with message.channel.typing():
         full_messages = []
 
-        system_content = build_system_context(db, context_key, context_label, is_dm=is_dm)
+        system_content = build_system_context(db, context_key, context_label, is_dm=is_dm, force_public_reply=force_public_reply, force_public_reply_reason=force_public_reply_reason)
         full_messages.append({"role": "system", "content": system_content})
 
         history = get_recent_messages(db, context_key)
@@ -1252,11 +1366,14 @@ async def on_message(message):
         if response_scripts_other_speaker(response_text):
             save_message(db, context_key, "assistant", "[blocked scripted non-Ben response]")
             return
-        response_text = fit_response_to_discord(clean_response_text(response_text))
+        response_text = clean_response_text(response_text)
 
         save_message(db, context_key, "assistant", response_text)
 
-        await send_ai_response(message.channel, response_text)
+        await send_ai_response(message.channel, response_text, source=source, trigger_message_id=message.id)
+        if source == "companion-bot":
+            bot_reply_cooldowns[message.channel.id] = datetime.now()
+            dedupe_log("bot_reply_cooldown_set", source=source, channel_id=message.channel.id, discord_message_id=message.id, cooldown_seconds=BOT_REPLY_COOLDOWN_SECONDS)
 
 
 # ============================================
