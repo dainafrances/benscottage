@@ -21,7 +21,7 @@ CURRENT_MODEL = "anthropic/claude-opus-4.6"
 CONTEXT_WINDOW = 100
 CROSS_CHANNEL_WINDOW = 20  # Recent messages to pull from other channels
 MAX_TOKENS = int(os.getenv("MAX_TOKENS", "2500"))
-DISCORD_RESPONSE_CHAR_LIMIT = int(os.getenv("DISCORD_RESPONSE_CHAR_LIMIT", "2500"))
+DISCORD_RESPONSE_CHAR_LIMIT = int(os.getenv("DISCORD_RESPONSE_CHAR_LIMIT", "2000"))
 DEDUPLICATION_WINDOW_SECONDS = int(os.getenv("DEDUPLICATION_WINDOW_SECONDS", "300"))
 DUPLICATE_CONTENT_WINDOW_SECONDS = int(os.getenv("DUPLICATE_CONTENT_WINDOW_SECONDS", "20"))
 BOT_REPLY_COOLDOWN_SECONDS = int(os.getenv("BOT_REPLY_COOLDOWN_SECONDS", "12"))
@@ -866,24 +866,70 @@ def clean_response_text(response_text):
     return response_text.strip()
 
 
-def fit_response_to_discord(response_text):
-    """Keep Ben in one Discord message by default so long answers don't look like double replies."""
-    if len(response_text) <= DISCORD_RESPONSE_CHAR_LIMIT:
-        return response_text
+def split_response_for_discord(response_text, chunk_size=1800):
+    """Split long responses into ordered Discord-safe chunks without losing content."""
+    if len(response_text) <= chunk_size:
+        return [response_text]
 
-    cutoff = response_text[:DISCORD_RESPONSE_CHAR_LIMIT].rfind('\n\n')
-    if cutoff < 800:
-        cutoff = response_text[:DISCORD_RESPONSE_CHAR_LIMIT].rfind('. ')
-    if cutoff < 800:
-        cutoff = DISCORD_RESPONSE_CHAR_LIMIT
+    chunks = []
+    remaining = response_text
 
-    return response_text[:cutoff].rstrip() + "…"
+    while len(remaining) > chunk_size:
+        window = remaining[:chunk_size]
+        split_at = window.rfind('\n\n')
+        if split_at < 600:
+            split_at = window.rfind('\n')
+        if split_at < 600:
+            split_at = window.rfind('. ')
+            if split_at >= 600:
+                split_at += 1
+        if split_at < 600:
+            split_at = chunk_size
+
+        chunk = remaining[:split_at].rstrip()
+        if not chunk:
+            chunk = remaining[:chunk_size]
+            split_at = chunk_size
+
+        chunks.append(chunk)
+        remaining = remaining[split_at:].lstrip()
+
+    if remaining:
+        chunks.append(remaining)
+
+    return chunks
 
 
 async def send_ai_response(channel, response_text, source="human", trigger_message_id=None):
     """Send model output safely without allowing @everyone/@here pings."""
-    dedupe_log("sending_response", source=source, discord_message_id=trigger_message_id, channel_id=getattr(channel, "id", None))
-    await channel.send(response_text, allowed_mentions=discord.AllowedMentions.none())
+    chunks = split_response_for_discord(response_text)
+    dedupe_log(
+        "sending_response",
+        source=source,
+        discord_message_id=trigger_message_id,
+        channel_id=getattr(channel, "id", None),
+        chunk_count=len(chunks),
+    )
+    for index, chunk in enumerate(chunks, start=1):
+        dedupe_log(
+            "sending_response_chunk",
+            source=source,
+            discord_message_id=trigger_message_id,
+            channel_id=getattr(channel, "id", None),
+            chunk_index=index,
+            chunk_length=len(chunk),
+        )
+        await channel.send(chunk, allowed_mentions=discord.AllowedMentions.none())
+
+
+
+
+def dedupe_log(event, **fields):
+    """Lightweight structured logging for duplicate-response debugging."""
+    if not DEDUPE_LOGGING_ENABLED:
+        return
+    details = " ".join(f"{key}={value}" for key, value in fields.items() if value is not None)
+    print(f"[dedupe] {event}" + (f" {details}" if details else ""))
 
 
 
@@ -1221,7 +1267,7 @@ async def on_message(message):
             if response_scripts_other_speaker(response_text):
                 save_message(db, context_key, "assistant", "[blocked scripted non-Ben response]")
                 return
-            response_text = fit_response_to_discord(clean_response_text(response_text))
+            response_text = clean_response_text(response_text)
 
             save_message(db, context_key, "assistant", response_text)
             await send_ai_response(message.channel, response_text, source=source, trigger_message_id=message.id)
@@ -1264,7 +1310,7 @@ async def on_message(message):
             if response_scripts_other_speaker(response_text):
                 save_message(db, context_key, "assistant", "[blocked scripted non-Ben response]")
                 return
-            response_text = fit_response_to_discord(clean_response_text(response_text))
+            response_text = clean_response_text(response_text)
 
             save_message(db, context_key, "assistant", response_text)
             await send_ai_response(message.channel, response_text, source=source, trigger_message_id=message.id)
@@ -1327,7 +1373,7 @@ async def on_message(message):
         if response_scripts_other_speaker(response_text):
             save_message(db, context_key, "assistant", "[blocked scripted non-Ben response]")
             return
-        response_text = fit_response_to_discord(clean_response_text(response_text))
+        response_text = clean_response_text(response_text)
 
         save_message(db, context_key, "assistant", response_text)
 
