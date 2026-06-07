@@ -23,6 +23,12 @@ messages. Ben replies directly to that companion once, then will not answer that
 bot again until a human addresses Ben. The per-channel time cooldown remains as an
 additional anti-loop safety layer.
 
+Ben may intentionally write one known companion mention such as `@Colin`. After Ben
+has observed a message from that companion, the send layer converts the first such
+name into a real Discord mention. Only known companion-bot IDs are permitted; human,
+role, `@everyone`, and `@here` pings remain blocked. The existing one-exchange latch
+prevents that mention from becoming an endless bot conversation.
+
 This repository controls Ben only. Colin needs the same Message Content Intent and
 equivalent observe/respond routing in his own bot deployment for the behavior to work
 in both directions.

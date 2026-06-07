@@ -32,6 +32,9 @@ HOME_SERVER_ID = os.getenv("HOME_SERVER_ID", "")
 
 # Companion bot names (other LBBs on shared servers)
 COMPANION_NAMES = ["rafayel", "elias", "colin", "moose", "solace"]
+# Known companion IDs are learned from messages so Ben can turn an intentional
+# plain-text @Colin into a real Discord mention without enabling arbitrary pings.
+companion_user_ids = {}
 
 # Track which companion bots Ben has already answered in the current exchange.
 # Cleared only when a human addresses Ben, so background human chat does not
@@ -258,6 +261,8 @@ You should respond if:
 
 Write only Ben's own reply. Never script, simulate, or prefill a message from another human or bot. Do not start a response with labels like "Human:", "Daina:", "Rachael:", "Cassidy:", or any other speaker name unless you are briefly quoting something that already happened.
 
+
+You may directly ping one known companion bot (for example, @Colin) when you genuinely want to invite that companion into the conversation. Use at most one companion @mention per reply. Do not ping companions automatically or merely because their name came up.
 
 ## IMPORTANT NOTE ABOUT THIS PLATFORM
 
@@ -868,6 +873,47 @@ def response_scripts_other_speaker(response_text):
     return False
 
 
+def remember_companion_user(user):
+    """Remember known companion bot IDs from messages Discord has delivered."""
+    if not getattr(user, "bot", False):
+        return
+
+    candidate_names = {
+        getattr(user, "name", "").lower(),
+        getattr(user, "display_name", "").lower(),
+        getattr(user, "global_name", "").lower(),
+    }
+    for companion_name in COMPANION_NAMES:
+        if companion_name in candidate_names:
+            companion_user_ids[companion_name] = user.id
+
+
+def render_companion_mentions(response_text):
+    """Convert the first intentional known-companion @Name into a safe mention."""
+    earliest_match = None
+    earliest_user_id = None
+
+    for companion_name in COMPANION_NAMES:
+        user_id = companion_user_ids.get(companion_name)
+        if not user_id:
+            continue
+
+        match = re.search(rf'@{re.escape(companion_name)}\b', response_text, re.IGNORECASE)
+        if match and (earliest_match is None or match.start() < earliest_match.start()):
+            earliest_match = match
+            earliest_user_id = user_id
+
+    if earliest_match is None:
+        return response_text, []
+
+    rendered_text = (
+        response_text[:earliest_match.start()]
+        + f"<@{earliest_user_id}>"
+        + response_text[earliest_match.end():]
+    )
+    return rendered_text, [earliest_user_id]
+
+
 def clean_response_text(response_text):
     """Remove risky model artifacts before sending to Discord."""
     response_text = response_text.strip()
@@ -923,8 +969,22 @@ async def send_ai_response(
     trigger_message_id=None,
     trigger_message=None,
 ):
-    """Send model output safely, replying to companion bots on the first chunk."""
+    """Send model output safely, allowing only intentional companion mentions."""
+    response_text, companion_mentions = render_companion_mentions(response_text)
     chunks = split_response_for_discord(response_text)
+    allowed_companion_mentions = discord.AllowedMentions(
+        everyone=False,
+        users=[discord.Object(id=user_id) for user_id in companion_mentions],
+        roles=False,
+        replied_user=False,
+    )
+    if companion_mentions:
+        dedupe_log(
+            "companion_mention_rendered",
+            companion_user_id=companion_mentions[0],
+            discord_message_id=trigger_message_id,
+            channel_id=getattr(channel, "id", None),
+        )
     dedupe_log(
         "sending_response",
         source=source,
@@ -947,13 +1007,13 @@ async def send_ai_response(
                 mention_author=True,
                 allowed_mentions=discord.AllowedMentions(
                     everyone=False,
-                    users=False,
+                    users=[discord.Object(id=user_id) for user_id in companion_mentions],
                     roles=False,
                     replied_user=True,
                 ),
             )
         else:
-            await channel.send(chunk, allowed_mentions=discord.AllowedMentions.none())
+            await channel.send(chunk, allowed_mentions=allowed_companion_mentions)
 
 
 
@@ -1079,6 +1139,8 @@ async def on_message(message):
     is_dm = message.guild is None
     is_home = message.guild and str(message.guild.id) == HOME_SERVER_ID
     source = "companion-bot" if is_bot_author else "human"
+    if is_bot_author:
+        remember_companion_user(message.author)
     force_public_reply = False
     force_public_reply_reason = None
 
