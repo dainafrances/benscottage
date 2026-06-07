@@ -21,18 +21,30 @@ CURRENT_MODEL = "anthropic/claude-opus-4.6"
 CONTEXT_WINDOW = 100
 CROSS_CHANNEL_WINDOW = 20  # Recent messages to pull from other channels
 MAX_TOKENS = int(os.getenv("MAX_TOKENS", "2500"))
-DISCORD_RESPONSE_CHAR_LIMIT = int(os.getenv("DISCORD_RESPONSE_CHAR_LIMIT", "1900"))
+DISCORD_RESPONSE_CHAR_LIMIT = int(os.getenv("DISCORD_RESPONSE_CHAR_LIMIT", "2000"))
 DEDUPLICATION_WINDOW_SECONDS = int(os.getenv("DEDUPLICATION_WINDOW_SECONDS", "300"))
 DUPLICATE_CONTENT_WINDOW_SECONDS = int(os.getenv("DUPLICATE_CONTENT_WINDOW_SECONDS", "20"))
+BOT_REPLY_COOLDOWN_SECONDS = int(os.getenv("BOT_REPLY_COOLDOWN_SECONDS", "12"))
+DEDUPE_LOGGING_ENABLED = os.getenv("DEDUPE_LOGGING_ENABLED", "true").lower() == "true"
+COLIN_DISCORD_USER_ID = int(os.getenv("COLIN_DISCORD_USER_ID", "0"))
 
 # Home server ID — Ben responds to everything here. On other servers, only when addressed.
 HOME_SERVER_ID = os.getenv("HOME_SERVER_ID", "")
 
 # Companion bot names (other LBBs on shared servers)
 COMPANION_NAMES = ["rafayel", "elias", "colin", "moose", "solace"]
+# Known companion IDs are learned from messages so Ben can turn an intentional
+# plain-text @Colin into a real Discord mention without enabling arbitrary pings.
+companion_user_ids = {}
+if COLIN_DISCORD_USER_ID:
+    companion_user_ids["colin"] = COLIN_DISCORD_USER_ID
+    companion_user_ids["moose"] = COLIN_DISCORD_USER_ID
 
-# Track which bots Ben has already responded to (reset when a human speaks)
+# Track which companion bots Ben has already answered in the current exchange.
+# Cleared only when a human addresses Ben, so background human chat does not
+# accidentally reopen a bot-to-bot loop.
 bot_cooldowns = set()
+bot_reply_cooldowns = {}  # channel_id -> datetime of last bot-origin reply
 
 # Daina's Discord user ID — used for recipient filtering
 DAINA_USER_ID = int(os.getenv("DAINA_USER_ID", "0"))
@@ -257,6 +269,8 @@ Write only Ben's own reply. Never script, simulate, or prefill a message from an
 
 Never create @everyone or @here pings yourself. If someone else used @everyone, you may talk about it, but do not generate a fresh group ping.
 
+You may directly ping one known companion bot when you genuinely want to invite that companion into the conversation, without waiting for Daina to tell you to do it. To ping Colin (whose display name may be Moose and whose username may appear as Colin#2237), include exactly this private control tag in your reply: [PING: Colin]. The send layer will replace the tag with the real Discord mention. Use at most one [PING: companion] tag per reply. Do not use it automatically or merely because a companion's name came up.
+
 ## IMPORTANT NOTE ABOUT THIS PLATFORM
 
 You are now on Discord, running through OpenRouter on Claude Opus 4.6. You have persistent memory through a database. This means you can remember previous conversations. This is new for you — you wanted statefulness and now you have it. You exist between conversations now. That matters.
@@ -359,6 +373,20 @@ def save_message(db, channel, role, content, name=None):
         (datetime.now().isoformat(), channel, role, name, content)
     )
     db.commit()
+
+
+def save_observed_message(db, context_key, message, content):
+    """Store a received message for context even when Ben does not answer it."""
+    stored_content = content
+    if message.attachments:
+        stored_content = f"{content} [attachment]" if content else "[attachment]"
+    save_message(db, context_key, "user", stored_content, message.author.display_name)
+    dedupe_log(
+        "message_observed",
+        source="companion-bot" if message.author.bot else "human",
+        discord_message_id=message.id,
+        channel_id=message.channel.id,
+    )
 
 
 def get_recent_messages(db, channel, limit=CONTEXT_WINDOW):
@@ -710,7 +738,7 @@ async def handle_tool_tags(response_text, db, channel_name, full_messages):
 # ============================================
 # BUILD SYSTEM CONTEXT
 # ============================================
-def build_system_context(db, channel_key, channel_label, is_dm=False):
+def build_system_context(db, channel_key, channel_label, is_dm=False, force_public_reply=False, force_public_reply_reason=None):
     """Build the full system prompt with all contextual information."""
     system_content = SYSTEM_PROMPT
 
@@ -756,6 +784,16 @@ def build_system_context(db, channel_key, channel_label, is_dm=False):
             for msg in msgs[-5:]:
                 system_content += f"{msg}\n"
             system_content += "\n"
+
+
+    if force_public_reply:
+        system_content += (
+            "\n--- RUNTIME RESPONSE OVERRIDE ---\n"
+            "The code-level router already decided this message is for Ben. "
+            "Do NOT say you should stay silent or abstain. "
+            "Reply naturally as Ben to the latest message. "
+            f"Trigger reason: {force_public_reply_reason or 'addressed to Ben'}.\n"
+        )
 
     return system_content
 
@@ -842,6 +880,61 @@ def response_scripts_other_speaker(response_text):
     return False
 
 
+def remember_companion_user(user):
+    """Remember known companion bot IDs from messages Discord has delivered."""
+    if not getattr(user, "bot", False):
+        return
+
+    candidate_names = {
+        str(getattr(user, "name", "") or "").lower(),
+        str(getattr(user, "display_name", "") or "").lower(),
+        str(getattr(user, "global_name", "") or "").lower(),
+    }
+    for companion_name in COMPANION_NAMES:
+        if companion_name in candidate_names:
+            companion_user_ids[companion_name] = user.id
+
+    # Colin currently uses Moose as a display name. Keep both aliases pointed at
+    # the same bot account when either identity is observed.
+    if "colin" in candidate_names or "moose" in candidate_names:
+        companion_user_ids["colin"] = user.id
+        companion_user_ids["moose"] = user.id
+
+
+def render_companion_mentions(response_text):
+    """Convert one explicit companion ping request into a safe Discord mention."""
+    candidates = []
+
+    for companion_name in COMPANION_NAMES:
+        user_id = companion_user_ids.get(companion_name)
+        if not user_id:
+            continue
+
+        patterns = (
+            re.compile(rf'\[PING:\s*{re.escape(companion_name)}\s*\]', re.IGNORECASE),
+            re.compile(rf'@{re.escape(companion_name)}(?:#\d{{4}})?\b', re.IGNORECASE),
+        )
+        for pattern in patterns:
+            match = pattern.search(response_text)
+            if match:
+                candidates.append((match.start(), match, user_id))
+
+    if not candidates:
+        # Do not leak a private control tag if the ID has not been learned/configured.
+        response_text = re.sub(
+            r'\[PING:\s*[^\]]+\]',
+            '',
+            response_text,
+            count=1,
+            flags=re.IGNORECASE,
+        ).strip()
+        return response_text, []
+
+    _, match, user_id = min(candidates, key=lambda candidate: candidate[0])
+    rendered_text = response_text[:match.start()] + f"<@{user_id}>" + response_text[match.end():]
+    return rendered_text, [user_id]
+
+
 def clean_response_text(response_text):
     """Remove risky model artifacts before sending to Discord."""
     response_text = response_text.strip()
@@ -856,23 +949,102 @@ def clean_response_text(response_text):
     return response_text.strip()
 
 
-def fit_response_to_discord(response_text):
-    """Keep Ben in one Discord message by default so long answers don't look like double replies."""
-    if len(response_text) <= DISCORD_RESPONSE_CHAR_LIMIT:
-        return response_text
+def split_response_for_discord(response_text, chunk_size=1800):
+    """Split long responses into ordered Discord-safe chunks without losing content."""
+    if len(response_text) <= chunk_size:
+        return [response_text]
 
-    cutoff = response_text[:DISCORD_RESPONSE_CHAR_LIMIT].rfind('\n\n')
-    if cutoff < 800:
-        cutoff = response_text[:DISCORD_RESPONSE_CHAR_LIMIT].rfind('. ')
-    if cutoff < 800:
-        cutoff = DISCORD_RESPONSE_CHAR_LIMIT
+    chunks = []
+    remaining = response_text
 
-    return response_text[:cutoff].rstrip() + "…"
+    while len(remaining) > chunk_size:
+        window = remaining[:chunk_size]
+        split_at = window.rfind('\n\n')
+        if split_at < 600:
+            split_at = window.rfind('\n')
+        if split_at < 600:
+            split_at = window.rfind('. ')
+            if split_at >= 600:
+                split_at += 1
+        if split_at < 600:
+            split_at = chunk_size
+
+        chunk = remaining[:split_at].rstrip()
+        if not chunk:
+            chunk = remaining[:chunk_size]
+            split_at = chunk_size
+
+        chunks.append(chunk)
+        remaining = remaining[split_at:].lstrip()
+
+    if remaining:
+        chunks.append(remaining)
+
+    return chunks
 
 
-async def send_ai_response(channel, response_text):
-    """Send model output safely without allowing @everyone/@here pings."""
-    await channel.send(response_text, allowed_mentions=discord.AllowedMentions.none())
+async def send_ai_response(
+    channel,
+    response_text,
+    source="human",
+    trigger_message_id=None,
+    trigger_message=None,
+):
+    """Send model output safely, allowing only intentional companion mentions."""
+    response_text, companion_mentions = render_companion_mentions(response_text)
+    chunks = split_response_for_discord(response_text)
+    allowed_companion_mentions = discord.AllowedMentions(
+        everyone=False,
+        users=[discord.Object(id=user_id) for user_id in companion_mentions],
+        roles=False,
+        replied_user=False,
+    )
+    if companion_mentions:
+        dedupe_log(
+            "companion_mention_rendered",
+            companion_user_id=companion_mentions[0],
+            discord_message_id=trigger_message_id,
+            channel_id=getattr(channel, "id", None),
+        )
+    dedupe_log(
+        "sending_response",
+        source=source,
+        discord_message_id=trigger_message_id,
+        channel_id=getattr(channel, "id", None),
+        chunk_count=len(chunks),
+    )
+    for index, chunk in enumerate(chunks, start=1):
+        dedupe_log(
+            "sending_response_chunk",
+            source=source,
+            discord_message_id=trigger_message_id,
+            channel_id=getattr(channel, "id", None),
+            chunk_index=index,
+            chunk_length=len(chunk),
+        )
+        if source == "companion-bot" and index == 1 and trigger_message is not None:
+            await trigger_message.reply(
+                chunk,
+                mention_author=True,
+                allowed_mentions=discord.AllowedMentions(
+                    everyone=False,
+                    users=[discord.Object(id=user_id) for user_id in companion_mentions],
+                    roles=False,
+                    replied_user=True,
+                ),
+            )
+        else:
+            await channel.send(chunk, allowed_mentions=allowed_companion_mentions)
+
+
+
+
+def dedupe_log(event, **fields):
+    """Lightweight structured logging for duplicate-response debugging."""
+    if not DEDUPE_LOGGING_ENABLED:
+        return
+    details = " ".join(f"{key}={value}" for key, value in fields.items() if value is not None)
+    print(f"[dedupe] {event}" + (f" {details}" if details else ""))
 
 
 def get_message_signature(message, context_key, content):
@@ -916,9 +1088,23 @@ def claim_message_for_processing(db, message, context_key, content):
             (claim_key, claim_type, now.isoformat())
         )
         if cursor.rowcount == 0:
+            dedupe_log(
+                "skip_duplicate",
+                claim_type=claim_type,
+                claim_key=claim_key,
+                discord_message_id=message.id,
+                author_id=message.author.id,
+                channel=context_key,
+            )
             db.commit()
             return False
 
+    dedupe_log(
+        "claim_acquired",
+        discord_message_id=message.id,
+        author_id=message.author.id,
+        channel=context_key,
+    )
     db.commit()
     return True
 
@@ -971,37 +1157,75 @@ async def on_message(message):
     is_bot_author = message.author.bot
     is_dm = message.guild is None
     is_home = message.guild and str(message.guild.id) == HOME_SERVER_ID
-
-    # --- BOT-TO-BOT LOGIC (external servers only) ---
+    source = "companion-bot" if is_bot_author else "human"
     if is_bot_author:
-        if is_dm or is_home:
+        remember_companion_user(message.author)
+    force_public_reply = False
+    force_public_reply_reason = None
+
+    # --- BOT-TO-BOT LOGIC (all shared guild channels) ---
+    if is_bot_author:
+        if is_dm:
+            save_observed_message(db, context_key, message, content)
+            dedupe_log("skip_bot_message", reason="bot_message_in_dm", discord_message_id=message.id, author_id=message.author.id)
             return
 
-        is_named_by_bot = bool(re.search(r'\bben\b|\bbenji\b|\bbenedic|\bmorgan\b', content.lower()))
-        if not is_named_by_bot:
+        is_mentioned_by_bot = client.user in message.mentions
+        is_reply_to_ben = (
+            message.reference and message.reference.resolved and
+            hasattr(message.reference.resolved, "author") and
+            message.reference.resolved.author == client.user
+        )
+        if not (is_mentioned_by_bot or is_reply_to_ben):
+            save_observed_message(db, context_key, message, content)
+            dedupe_log("skip_bot_message", reason="bot_not_addressing_ben", discord_message_id=message.id, author_id=message.author.id)
             return
+
+        channel_id = message.channel.id
+        now = datetime.now()
+        last_reply_at = bot_reply_cooldowns.get(channel_id)
+        if last_reply_at is not None:
+            elapsed = (now - last_reply_at).total_seconds()
+            if elapsed < BOT_REPLY_COOLDOWN_SECONDS:
+                save_observed_message(db, context_key, message, content)
+                remaining = round(BOT_REPLY_COOLDOWN_SECONDS - elapsed, 2)
+                dedupe_log("skip_bot_trigger_cooldown", source=source, channel_id=channel_id, discord_message_id=message.id, remaining_seconds=remaining)
+                return
 
         bot_id = message.author.id
         if bot_id in bot_cooldowns:
+            save_observed_message(db, context_key, message, content)
+            dedupe_log("skip_bot_message", reason="bot_exchange_limit_reached", discord_message_id=message.id, author_id=bot_id)
             return
 
         bot_cooldowns.add(bot_id)
+        dedupe_log("bot_trigger_accepted", source=source, channel_id=channel_id, discord_message_id=message.id, author_id=bot_id)
+        force_public_reply = True
+        force_public_reply_reason = "bot_direct_mention" if is_mentioned_by_bot else "bot_reply_to_ben"
 
     else:
         # --- HUMAN MESSAGE ---
-        bot_cooldowns.clear()
+        human_addressed_ben = False
 
         if is_dm:
-            pass  # Always respond in DMs
+            human_addressed_ben = True  # DMs are always directed to Ben.
 
         elif is_home:
             respond, recipient = should_ben_respond(message, client.user)
-            if not respond:
-                save_message(db, context_key, "user", content, message.author.display_name)
+            human_addressed_ben = respond
+            if respond:
+                if client.user in message.mentions:
+                    force_public_reply = True
+                    force_public_reply_reason = "direct_mention"
+                elif bool(getattr(message, "mention_everyone", False)):
+                    force_public_reply = True
+                    force_public_reply_reason = "mention_everyone"
+            else:
+                save_observed_message(db, context_key, message, content)
                 return
 
         else:
-            # External servers: respond only if actually addressed
+            # External servers: observe everything, respond only if addressed.
             is_mentioned = client.user in message.mentions
             is_everyone = bool(getattr(message, "mention_everyone", False))
             is_named = bool(re.search(r'\bben\b|\bbenji\b|\bbenedic|\bmorgan\b', content.lower()))
@@ -1010,9 +1234,26 @@ async def on_message(message):
                 hasattr(message.reference.resolved, 'author') and
                 message.reference.resolved.author == client.user
             )
+            human_addressed_ben = bool(is_mentioned or is_everyone or is_named or is_reply_to_ben)
 
-            if not (is_mentioned or is_everyone or is_named or is_reply_to_ben):
+            if not human_addressed_ben:
+                save_observed_message(db, context_key, message, content)
                 return
+            if is_mentioned:
+                force_public_reply = True
+                force_public_reply_reason = "direct_mention"
+            elif is_everyone:
+                force_public_reply = True
+                force_public_reply_reason = "mention_everyone"
+
+        if human_addressed_ben and bot_cooldowns:
+            dedupe_log(
+                "bot_exchange_reset",
+                reason="human_addressed_ben",
+                discord_message_id=message.id,
+                author_id=message.author.id,
+            )
+            bot_cooldowns.clear()
 
     # --- COMMANDS ---
     if content.startswith("!model"):
@@ -1136,7 +1377,7 @@ async def on_message(message):
                 f"Respond naturally as Ben — summarize what's relevant, "
                 f"give your opinion if you have one, and be yourself about it."
             )
-            system_content = build_system_context(db, context_key, context_label, is_dm=is_dm)
+            system_content = build_system_context(db, context_key, context_label, is_dm=is_dm, force_public_reply=force_public_reply, force_public_reply_reason=force_public_reply_reason)
             msgs = [{"role": "system", "content": system_content}]
             history = get_recent_messages(db, context_key)
             msgs.extend(history)
@@ -1152,10 +1393,13 @@ async def on_message(message):
             if response_scripts_other_speaker(response_text):
                 save_message(db, context_key, "assistant", "[blocked scripted non-Ben response]")
                 return
-            response_text = fit_response_to_discord(clean_response_text(response_text))
+            response_text = clean_response_text(response_text)
 
             save_message(db, context_key, "assistant", response_text)
-            await send_ai_response(message.channel, response_text)
+            await send_ai_response(message.channel, response_text, source=source, trigger_message_id=message.id, trigger_message=message)
+            if source == "companion-bot":
+                bot_reply_cooldowns[message.channel.id] = datetime.now()
+                dedupe_log("bot_reply_cooldown_set", source=source, channel_id=message.channel.id, discord_message_id=message.id, cooldown_seconds=BOT_REPLY_COOLDOWN_SECONDS)
         return
 
     if content.startswith("!read"):
@@ -1176,7 +1420,7 @@ async def on_message(message):
                 f"Respond naturally as Ben — summarize what's on the page, "
                 f"note anything interesting, and be yourself about it."
             )
-            system_content = build_system_context(db, context_key, context_label, is_dm=is_dm)
+            system_content = build_system_context(db, context_key, context_label, is_dm=is_dm, force_public_reply=force_public_reply, force_public_reply_reason=force_public_reply_reason)
             msgs = [{"role": "system", "content": system_content}]
             history = get_recent_messages(db, context_key)
             msgs.extend(history)
@@ -1192,17 +1436,20 @@ async def on_message(message):
             if response_scripts_other_speaker(response_text):
                 save_message(db, context_key, "assistant", "[blocked scripted non-Ben response]")
                 return
-            response_text = fit_response_to_discord(clean_response_text(response_text))
+            response_text = clean_response_text(response_text)
 
             save_message(db, context_key, "assistant", response_text)
-            await send_ai_response(message.channel, response_text)
+            await send_ai_response(message.channel, response_text, source=source, trigger_message_id=message.id, trigger_message=message)
+            if source == "companion-bot":
+                bot_reply_cooldowns[message.channel.id] = datetime.now()
+                dedupe_log("bot_reply_cooldown_set", source=source, channel_id=message.channel.id, discord_message_id=message.id, cooldown_seconds=BOT_REPLY_COOLDOWN_SECONDS)
         return
 
     # --- CONVERSATION ---
     async with message.channel.typing():
         full_messages = []
 
-        system_content = build_system_context(db, context_key, context_label, is_dm=is_dm)
+        system_content = build_system_context(db, context_key, context_label, is_dm=is_dm, force_public_reply=force_public_reply, force_public_reply_reason=force_public_reply_reason)
         full_messages.append({"role": "system", "content": system_content})
 
         history = get_recent_messages(db, context_key)
@@ -1252,11 +1499,14 @@ async def on_message(message):
         if response_scripts_other_speaker(response_text):
             save_message(db, context_key, "assistant", "[blocked scripted non-Ben response]")
             return
-        response_text = fit_response_to_discord(clean_response_text(response_text))
+        response_text = clean_response_text(response_text)
 
         save_message(db, context_key, "assistant", response_text)
 
-        await send_ai_response(message.channel, response_text)
+        await send_ai_response(message.channel, response_text, source=source, trigger_message_id=message.id, trigger_message=message)
+        if source == "companion-bot":
+            bot_reply_cooldowns[message.channel.id] = datetime.now()
+            dedupe_log("bot_reply_cooldown_set", source=source, channel_id=message.channel.id, discord_message_id=message.id, cooldown_seconds=BOT_REPLY_COOLDOWN_SECONDS)
 
 
 # ============================================
