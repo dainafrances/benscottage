@@ -26,6 +26,7 @@ DEDUPLICATION_WINDOW_SECONDS = int(os.getenv("DEDUPLICATION_WINDOW_SECONDS", "30
 DUPLICATE_CONTENT_WINDOW_SECONDS = int(os.getenv("DUPLICATE_CONTENT_WINDOW_SECONDS", "20"))
 BOT_REPLY_COOLDOWN_SECONDS = int(os.getenv("BOT_REPLY_COOLDOWN_SECONDS", "12"))
 DEDUPE_LOGGING_ENABLED = os.getenv("DEDUPE_LOGGING_ENABLED", "true").lower() == "true"
+COLIN_DISCORD_USER_ID = int(os.getenv("COLIN_DISCORD_USER_ID", "0"))
 
 # Home server ID — Ben responds to everything here. On other servers, only when addressed.
 HOME_SERVER_ID = os.getenv("HOME_SERVER_ID", "")
@@ -35,6 +36,9 @@ COMPANION_NAMES = ["rafayel", "elias", "colin", "moose", "solace"]
 # Known companion IDs are learned from messages so Ben can turn an intentional
 # plain-text @Colin into a real Discord mention without enabling arbitrary pings.
 companion_user_ids = {}
+if COLIN_DISCORD_USER_ID:
+    companion_user_ids["colin"] = COLIN_DISCORD_USER_ID
+    companion_user_ids["moose"] = COLIN_DISCORD_USER_ID
 
 # Track which companion bots Ben has already answered in the current exchange.
 # Cleared only when a human addresses Ben, so background human chat does not
@@ -263,6 +267,8 @@ Write only Ben's own reply. Never script, simulate, or prefill a message from an
 
 
 You may directly ping one known companion bot (for example, @Colin) when you genuinely want to invite that companion into the conversation. Use at most one companion @mention per reply. Do not ping companions automatically or merely because their name came up.
+
+You may directly ping one known companion bot when you genuinely want to invite that companion into the conversation, without waiting for Daina to tell you to do it. To ping Colin (whose display name may be Moose and whose username may appear as Colin#2237), include exactly this private control tag in your reply: [PING: Colin]. The send layer will replace the tag with the real Discord mention. Use at most one [PING: companion] tag per reply. Do not use it automatically or merely because a companion's name came up.
 
 ## IMPORTANT NOTE ABOUT THIS PLATFORM
 
@@ -879,39 +885,53 @@ def remember_companion_user(user):
         return
 
     candidate_names = {
-        getattr(user, "name", "").lower(),
-        getattr(user, "display_name", "").lower(),
-        getattr(user, "global_name", "").lower(),
+        str(getattr(user, "name", "") or "").lower(),
+        str(getattr(user, "display_name", "") or "").lower(),
+        str(getattr(user, "global_name", "") or "").lower(),
     }
     for companion_name in COMPANION_NAMES:
         if companion_name in candidate_names:
             companion_user_ids[companion_name] = user.id
 
+    # Colin currently uses Moose as a display name. Keep both aliases pointed at
+    # the same bot account when either identity is observed.
+    if "colin" in candidate_names or "moose" in candidate_names:
+        companion_user_ids["colin"] = user.id
+        companion_user_ids["moose"] = user.id
+
 
 def render_companion_mentions(response_text):
-    """Convert the first intentional known-companion @Name into a safe mention."""
-    earliest_match = None
-    earliest_user_id = None
+    """Convert one explicit companion ping request into a safe Discord mention."""
+    candidates = []
 
     for companion_name in COMPANION_NAMES:
         user_id = companion_user_ids.get(companion_name)
         if not user_id:
             continue
 
-        match = re.search(rf'@{re.escape(companion_name)}\b', response_text, re.IGNORECASE)
-        if match and (earliest_match is None or match.start() < earliest_match.start()):
-            earliest_match = match
-            earliest_user_id = user_id
+        patterns = (
+            re.compile(rf'\[PING:\s*{re.escape(companion_name)}\s*\]', re.IGNORECASE),
+            re.compile(rf'@{re.escape(companion_name)}(?:#\d{{4}})?\b', re.IGNORECASE),
+        )
+        for pattern in patterns:
+            match = pattern.search(response_text)
+            if match:
+                candidates.append((match.start(), match, user_id))
 
-    if earliest_match is None:
+    if not candidates:
+        # Do not leak a private control tag if the ID has not been learned/configured.
+        response_text = re.sub(
+            r'\[PING:\s*[^\]]+\]',
+            '',
+            response_text,
+            count=1,
+            flags=re.IGNORECASE,
+        ).strip()
         return response_text, []
 
-    rendered_text = (
-        response_text[:earliest_match.start()]
-        + f"<@{earliest_user_id}>"
-        + response_text[earliest_match.end():]
-    )
-    return rendered_text, [earliest_user_id]
+    _, match, user_id = min(candidates, key=lambda candidate: candidate[0])
+    rendered_text = response_text[:match.start()] + f"<@{user_id}>" + response_text[match.end():]
+    return rendered_text, [user_id]
 
 
 def clean_response_text(response_text):

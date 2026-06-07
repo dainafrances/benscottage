@@ -23,11 +23,16 @@ messages. Ben replies directly to that companion once, then will not answer that
 bot again until a human addresses Ben. The per-channel time cooldown remains as an
 additional anti-loop safety layer.
 
-Ben may intentionally write one known companion mention such as `@Colin`. After Ben
-has observed a message from that companion, the send layer converts the first such
-name into a real Discord mention. Only known companion-bot IDs are permitted; human,
-role, `@everyone`, and `@here` pings remain blocked. The existing one-exchange latch
-prevents that mention from becoming an endless bot conversation.
+Ben may independently invite Colin by emitting the private control tag
+`[PING: Colin]`; he does not need a human to instruct him first. The send layer replaces
+that tag with Colin's real numeric Discord mention. `@Colin#2237` is only a username
+label, not the wire format Discord requires for a live ping.
+
+Set `COLIN_DISCORD_USER_ID` to Colin's numeric Discord user ID for reliable pings after
+every restart. Ben also learns the ID when he observes Colin/Moose, but the environment
+value removes that timing dependency. Only that known companion ID is permitted;
+human, role, `@everyone`, and `@here` pings remain blocked. The existing one-exchange
+latch prevents the ping from becoming an endless bot conversation.
 
 This repository controls Ben only. Colin needs the same Message Content Intent and
 equivalent observe/respond routing in his own bot deployment for the behavior to work
@@ -37,6 +42,7 @@ in both directions.
 
 - `DISCORD_RESPONSE_CHAR_LIMIT` (default: `2000`): legacy single-message limit setting. Long AI replies are currently sent as ordered chunks of at most 1800 characters.
 - `BOT_REPLY_COOLDOWN_SECONDS` (default: `12`): cooldown in seconds for **bot-origin triggers per channel** after Ben sends a bot-origin reply.
+- `COLIN_DISCORD_USER_ID`: Colin/Moose's numeric Discord user ID, used to render Ben's `[PING: Colin]` control tag as a real mention.
 - `DEDUPLICATION_WINDOW_SECONDS` (default: `300`): message-ID dedupe window.
 - `DUPLICATE_CONTENT_WINDOW_SECONDS` (default: `20`): content-signature dedupe window.
 - `DEDUPE_LOGGING_ENABLED` (default: `true`): enables lightweight dedupe/cooldown debug logging.
