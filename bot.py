@@ -27,6 +27,7 @@ DUPLICATE_CONTENT_WINDOW_SECONDS = int(os.getenv("DUPLICATE_CONTENT_WINDOW_SECON
 BOT_REPLY_COOLDOWN_SECONDS = int(os.getenv("BOT_REPLY_COOLDOWN_SECONDS", "12"))
 DEDUPE_LOGGING_ENABLED = os.getenv("DEDUPE_LOGGING_ENABLED", "true").lower() == "true"
 COLIN_DISCORD_USER_ID = int(os.getenv("COLIN_DISCORD_USER_ID", "0"))
+SOLACE_DISCORD_USER_ID = int(os.getenv("SOLACE_DISCORD_USER_ID", "1496237287825080390"))
 
 # Home server ID — Ben responds to everything here. On other servers, only when addressed.
 HOME_SERVER_ID = os.getenv("HOME_SERVER_ID", "")
@@ -858,6 +859,15 @@ def should_ben_respond(message, bot_user):
     return False, recipient
 
 
+def is_solace_everyone_message(message):
+    """Allow Solace's shared daily questions without trusting other bot broadcasts."""
+    return (
+        SOLACE_DISCORD_USER_ID
+        and message.author.id == SOLACE_DISCORD_USER_ID
+        and bool(getattr(message, "mention_everyone", False))
+    )
+
+
 def format_message_with_recipient(sender_name, content, recipient_label):
     """Format a message with sender → recipient labeling for context."""
     return f"[{sender_name} → {recipient_label}]: {content}"
@@ -1177,7 +1187,8 @@ async def on_message(message):
             hasattr(message.reference.resolved, "author") and
             message.reference.resolved.author == client.user
         )
-        if not (is_mentioned_by_bot or is_reply_to_ben):
+        is_everyone_from_solace = is_solace_everyone_message(message)
+        if not (is_mentioned_by_bot or is_reply_to_ben or is_everyone_from_solace):
             save_observed_message(db, context_key, message, content)
             dedupe_log("skip_bot_message", reason="bot_not_addressing_ben", discord_message_id=message.id, author_id=message.author.id)
             return
@@ -1202,7 +1213,12 @@ async def on_message(message):
         bot_cooldowns.add(bot_id)
         dedupe_log("bot_trigger_accepted", source=source, channel_id=channel_id, discord_message_id=message.id, author_id=bot_id)
         force_public_reply = True
-        force_public_reply_reason = "bot_direct_mention" if is_mentioned_by_bot else "bot_reply_to_ben"
+        if is_mentioned_by_bot:
+            force_public_reply_reason = "bot_direct_mention"
+        elif is_everyone_from_solace:
+            force_public_reply_reason = "solace_mention_everyone"
+        else:
+            force_public_reply_reason = "bot_reply_to_ben"
 
     else:
         # --- HUMAN MESSAGE ---
