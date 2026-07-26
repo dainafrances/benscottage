@@ -46,5 +46,6 @@ in both directions.
 - `DEDUPLICATION_WINDOW_SECONDS` (default: `300`): message-ID dedupe window.
 - `DUPLICATE_CONTENT_WINDOW_SECONDS` (default: `20`): content-signature dedupe window.
 - `DEDUPE_LOGGING_ENABLED` (default: `true`): enables lightweight dedupe/cooldown debug logging.
+- `DISCORD_TYPING_INDICATOR_ENABLED` (default: `false`): controls Discord's cosmetic typing indicator. Keep this off unless you specifically want it; while an AI response is being generated, Discord typing contexts repeatedly call the API and can contribute to global rate limits.
 
 Copy `.env.example` into your deployment environment and set values as needed.
