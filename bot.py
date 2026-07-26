@@ -6,6 +6,7 @@ import hashlib
 import os
 import re
 import asyncio
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from aiohttp import web
 
@@ -26,8 +27,12 @@ DEDUPLICATION_WINDOW_SECONDS = int(os.getenv("DEDUPLICATION_WINDOW_SECONDS", "30
 DUPLICATE_CONTENT_WINDOW_SECONDS = int(os.getenv("DUPLICATE_CONTENT_WINDOW_SECONDS", "20"))
 BOT_REPLY_COOLDOWN_SECONDS = int(os.getenv("BOT_REPLY_COOLDOWN_SECONDS", "12"))
 DEDUPE_LOGGING_ENABLED = os.getenv("DEDUPE_LOGGING_ENABLED", "true").lower() == "true"
+DISCORD_TYPING_INDICATOR_ENABLED = os.getenv(
+    "DISCORD_TYPING_INDICATOR_ENABLED", "false"
+).lower() == "true"
 COLIN_DISCORD_USER_ID = int(os.getenv("COLIN_DISCORD_USER_ID", "0"))
 SOLACE_DISCORD_USER_ID = int(os.getenv("SOLACE_DISCORD_USER_ID", "1496237287825080390"))
+RAFAYEL_DISCORD_USER_ID = int(os.getenv("RAFAYEL_DISCORD_USER_ID", "1485217552190804038"))
 
 # Home server ID — Ben responds to everything here. On other servers, only when addressed.
 HOME_SERVER_ID = os.getenv("HOME_SERVER_ID", "")
@@ -864,11 +869,14 @@ def should_ben_respond(message, bot_user):
     return False, recipient
 
 
-def is_solace_everyone_message(message):
-    """Allow Solace's shared daily questions without trusting other bot broadcasts."""
+def is_trusted_companion_everyone_message(message):
+    """Allow trusted companions' shared questions without trusting other bots."""
     return (
-        SOLACE_DISCORD_USER_ID
-        and message.author.id == SOLACE_DISCORD_USER_ID
+        message.author.id in {
+            companion_id
+            for companion_id in (SOLACE_DISCORD_USER_ID, RAFAYEL_DISCORD_USER_ID)
+            if companion_id
+        }
         and bool(getattr(message, "mention_everyone", False))
     )
 
@@ -997,6 +1005,21 @@ def split_response_for_discord(response_text, chunk_size=1800):
     return chunks
 
 
+@asynccontextmanager
+async def optional_typing(channel):
+    """Show Discord's typing indicator only when it is explicitly enabled.
+
+    A typing context repeatedly calls Discord's ``/typing`` endpoint while a
+    slow model response is being generated. It is cosmetic, so it is disabled
+    by default to preserve the global API request budget for actual replies.
+    """
+    if DISCORD_TYPING_INDICATOR_ENABLED:
+        async with channel.typing():
+            yield
+    else:
+        yield
+
+
 async def send_ai_response(
     channel,
     response_text,
@@ -1051,9 +1074,6 @@ async def send_ai_response(
             await channel.send(chunk, allowed_mentions=allowed_companion_mentions)
 
 
-
-    if remaining:
-        chunks.append(remaining)
 
 def dedupe_log(event, **fields):
     """Lightweight structured logging for duplicate-response debugging."""
@@ -1192,8 +1212,8 @@ async def on_message(message):
             hasattr(message.reference.resolved, "author") and
             message.reference.resolved.author == client.user
         )
-        is_everyone_from_solace = is_solace_everyone_message(message)
-        if not (is_mentioned_by_bot or is_reply_to_ben or is_everyone_from_solace):
+        is_everyone_from_trusted_companion = is_trusted_companion_everyone_message(message)
+        if not (is_mentioned_by_bot or is_reply_to_ben or is_everyone_from_trusted_companion):
             save_observed_message(db, context_key, message, content)
             dedupe_log("skip_bot_message", reason="bot_not_addressing_ben", discord_message_id=message.id, author_id=message.author.id)
             return
@@ -1220,8 +1240,8 @@ async def on_message(message):
         force_public_reply = True
         if is_mentioned_by_bot:
             force_public_reply_reason = "bot_direct_mention"
-        elif is_everyone_from_solace:
-            force_public_reply_reason = "solace_mention_everyone"
+        elif is_everyone_from_trusted_companion:
+            force_public_reply_reason = "trusted_companion_mention_everyone"
         else:
             force_public_reply_reason = "bot_reply_to_ben"
 
@@ -1387,7 +1407,7 @@ async def on_message(message):
         if not query:
             await message.channel.send("*Use: !search what is Tavily*")
             return
-        async with message.channel.typing():
+        async with optional_typing(message.channel):
             data, error = await web_search(query)
             if error:
                 await message.channel.send(f"*{error}*")
@@ -1431,7 +1451,7 @@ async def on_message(message):
             return
         if not url.startswith("http"):
             url = "https://" + url
-        async with message.channel.typing():
+        async with optional_typing(message.channel):
             text, error = await fetch_url_text(url)
             if error:
                 await message.channel.send(f"*{error}*")
@@ -1468,7 +1488,7 @@ async def on_message(message):
         return
 
     # --- CONVERSATION ---
-    async with message.channel.typing():
+    async with optional_typing(message.channel):
         full_messages = []
 
         system_content = build_system_context(db, context_key, context_label, is_dm=is_dm, force_public_reply=force_public_reply, force_public_reply_reason=force_public_reply_reason)

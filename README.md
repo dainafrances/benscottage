@@ -19,9 +19,10 @@ normal response-routing rules accept the message.
 ## Bot-to-bot exchange safety
 
 A companion bot may trigger Ben by directly mentioning him or replying to one of his
-messages. Ben replies directly to that companion once, then will not answer that same
-bot again until a human addresses Ben. The per-channel time cooldown remains as an
-additional anti-loop safety layer.
+messages. Trusted companion IDs for Solace and Rafayel may also trigger Ben with their
+shared `@everyone` questions. Ben replies directly to that companion once, then will
+not answer that same bot again until a human addresses Ben. The per-channel time
+cooldown remains as an additional anti-loop safety layer.
 
 Ben may independently invite Colin by emitting the private control tag
 `[PING: Colin]`; he does not need a human to instruct him first. The send layer replaces
@@ -43,8 +44,11 @@ in both directions.
 - `DISCORD_RESPONSE_CHAR_LIMIT` (default: `2000`): legacy single-message limit setting. Long AI replies are currently sent as ordered chunks of at most 1800 characters.
 - `BOT_REPLY_COOLDOWN_SECONDS` (default: `12`): cooldown in seconds for **bot-origin triggers per channel** after Ben sends a bot-origin reply.
 - `COLIN_DISCORD_USER_ID`: Colin/Moose's numeric Discord user ID, used to render Ben's `[PING: Colin]` control tag as a real mention.
+- `SOLACE_DISCORD_USER_ID` (default: Solace's known Discord ID): permits Ben to answer Solace's `@everyone` questions.
+- `RAFAYEL_DISCORD_USER_ID` (default: `1485217552190804038`): permits Ben to answer Rafayel's `@everyone` questions.
 - `DEDUPLICATION_WINDOW_SECONDS` (default: `300`): message-ID dedupe window.
 - `DUPLICATE_CONTENT_WINDOW_SECONDS` (default: `20`): content-signature dedupe window.
 - `DEDUPE_LOGGING_ENABLED` (default: `true`): enables lightweight dedupe/cooldown debug logging.
+- `DISCORD_TYPING_INDICATOR_ENABLED` (default: `false`): controls Discord's cosmetic typing indicator. Keep this off unless you specifically want it; while an AI response is being generated, Discord typing contexts repeatedly call the API and can contribute to global rate limits.
 
 Copy `.env.example` into your deployment environment and set values as needed.
