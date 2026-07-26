@@ -6,6 +6,7 @@ import hashlib
 import os
 import re
 import asyncio
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from aiohttp import web
 
@@ -26,6 +27,9 @@ DEDUPLICATION_WINDOW_SECONDS = int(os.getenv("DEDUPLICATION_WINDOW_SECONDS", "30
 DUPLICATE_CONTENT_WINDOW_SECONDS = int(os.getenv("DUPLICATE_CONTENT_WINDOW_SECONDS", "20"))
 BOT_REPLY_COOLDOWN_SECONDS = int(os.getenv("BOT_REPLY_COOLDOWN_SECONDS", "12"))
 DEDUPE_LOGGING_ENABLED = os.getenv("DEDUPE_LOGGING_ENABLED", "true").lower() == "true"
+DISCORD_TYPING_INDICATOR_ENABLED = os.getenv(
+    "DISCORD_TYPING_INDICATOR_ENABLED", "false"
+).lower() == "true"
 COLIN_DISCORD_USER_ID = int(os.getenv("COLIN_DISCORD_USER_ID", "0"))
 SOLACE_DISCORD_USER_ID = int(os.getenv("SOLACE_DISCORD_USER_ID", "1496237287825080390"))
 
@@ -997,6 +1001,21 @@ def split_response_for_discord(response_text, chunk_size=1800):
     return chunks
 
 
+@asynccontextmanager
+async def optional_typing(channel):
+    """Show Discord's typing indicator only when it is explicitly enabled.
+
+    A typing context repeatedly calls Discord's ``/typing`` endpoint while a
+    slow model response is being generated. It is cosmetic, so it is disabled
+    by default to preserve the global API request budget for actual replies.
+    """
+    if DISCORD_TYPING_INDICATOR_ENABLED:
+        async with channel.typing():
+            yield
+    else:
+        yield
+
+
 async def send_ai_response(
     channel,
     response_text,
@@ -1051,9 +1070,6 @@ async def send_ai_response(
             await channel.send(chunk, allowed_mentions=allowed_companion_mentions)
 
 
-
-    if remaining:
-        chunks.append(remaining)
 
 def dedupe_log(event, **fields):
     """Lightweight structured logging for duplicate-response debugging."""
@@ -1387,7 +1403,7 @@ async def on_message(message):
         if not query:
             await message.channel.send("*Use: !search what is Tavily*")
             return
-        async with message.channel.typing():
+        async with optional_typing(message.channel):
             data, error = await web_search(query)
             if error:
                 await message.channel.send(f"*{error}*")
@@ -1431,7 +1447,7 @@ async def on_message(message):
             return
         if not url.startswith("http"):
             url = "https://" + url
-        async with message.channel.typing():
+        async with optional_typing(message.channel):
             text, error = await fetch_url_text(url)
             if error:
                 await message.channel.send(f"*{error}*")
@@ -1468,7 +1484,7 @@ async def on_message(message):
         return
 
     # --- CONVERSATION ---
-    async with message.channel.typing():
+    async with optional_typing(message.channel):
         full_messages = []
 
         system_content = build_system_context(db, context_key, context_label, is_dm=is_dm, force_public_reply=force_public_reply, force_public_reply_reason=force_public_reply_reason)
